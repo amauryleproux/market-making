@@ -1,0 +1,18 @@
+{
+    "global": {
+        "kill_switch_usd": 200,
+        "dashboard": true
+    },
+    "pairs": {
+        "MEGA": {
+            "enabled": true,
+            "spread_bps": 12,
+            "order_size_usd": 25,
+            "num_levels": 2,
+            "level_spacing_bps": 5,
+            "max_inventory_usd": 100,
+            "inventory_skew_factor": 0.8,
+            "refresh_interval_sec": 10
+        }
+    }
+}

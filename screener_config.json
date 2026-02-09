@@ -1,0 +1,46 @@
+{
+    "screener": {
+        "scan_interval_sec": 300,
+        "deep_scan_interval_sec": 1800,
+
+        "filters": {
+            "min_volume_usd": 100000,
+            "max_volume_usd": 5000000000,
+            "min_spread_bps": 3.0,
+            "min_score": 40
+        },
+
+        "weights": {
+            "spread": 0.20,
+            "volume": 0.15,
+            "depth": 0.10,
+            "levels": 0.05,
+            "funding": 0.05,
+            "toxicity": 0.35,
+            "backtest": 0.10
+        },
+
+        "toxicity": {
+            "horizons_sec": [1, 5, 30, 60],
+            "min_trades_for_analysis": 100,
+            "data_dir": "backtesting/data/market_data",
+            "use_live_fallback": true
+        },
+
+        "backtest": {
+            "results_dir": "backtesting/results",
+            "min_confidence": 0.3,
+            "auto_run": false
+        },
+
+        "rotation": {
+            "threshold_score_diff": 15,
+            "cooldown_sec": 600,
+            "max_active_pairs": 5
+        },
+
+        "blacklist": [],
+
+        "whitelist_priority": ["ETH", "BTC"]
+    }
+}

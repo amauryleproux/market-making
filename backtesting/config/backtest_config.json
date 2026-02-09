@@ -1,0 +1,18 @@
+{
+    "coin": "MEGA",
+    "start_date": "2026-02-09",
+    "end_date": "2026-02-09",
+    "data_dir": "backtesting/data/market_data",
+    "spread_bps": 12,
+    "order_size_usd": 25,
+    "num_levels": 2,
+    "level_spacing_bps": 5,
+    "max_inventory_usd": 100,
+    "inventory_skew_factor": 0.8,
+    "take_profit_enabled": false,
+    "take_profit_pct": 0.5,
+    "take_profit_min_usd": 0.10,
+    "latency_ms": 300,
+    "maker_fee_bps": -2.0,
+    "aggressive_fill": false
+}

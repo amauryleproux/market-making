@@ -1,0 +1,39 @@
+# Secrets
+.env
+.env.*
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Data (regenerable via collector)
+backtesting/data/market_data/**/*.parquet
+backtesting/results/*.txt
+backtesting/results/*.csv
+backtesting/results/*.png
+
+# Databases / logs
+data/*.db
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Screenshots / misc
+*.png
+trade_history.csv
+results/
