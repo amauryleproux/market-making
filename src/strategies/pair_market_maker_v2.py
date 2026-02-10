@@ -224,14 +224,14 @@ class FlowAnalyzer:
         if count < 5:
             return "calm", 0.0
 
-        if abs_imb >= 0.65:
+        if abs_imb >= 0.75:  # BONUS: 0.65→0.75 (aligned with FLOW_TREND_THRESHOLD)
             regime = "trending_up" if imbalance > 0 else "trending_down"
             confidence = min(1.0, abs_imb)
             return regime, confidence
         elif abs_imb < 0.5:
             return "calm", 1.0 - abs_imb
         else:
-            # Zone grise 0.5-0.65: calm mais faible confiance
+            # Zone grise 0.5-0.75: calm mais faible confiance
             return "calm", 0.3
 
     def is_safe_to_quote(self) -> tuple[bool, str]:
@@ -283,17 +283,17 @@ class PairMarketMakerV2:
     IMBALANCE_SKEW_FACTOR = 0.3     # Pondération de l'imbalance sur le skew
 
     # --- Flow safety ---
-    SAFE_FLOW_WAIT_SEC = 5.0        # Secondes de flow safe avant de quoter
+    SAFE_FLOW_WAIT_SEC = 8.0        # Secondes de flow safe avant de quoter (BONUS: 5→8)
 
     # --- Flow regime thresholds ---
     FLOW_CALM_THRESHOLD = 0.5       # Imbalance < 0.5 → calm
-    FLOW_TREND_THRESHOLD = 0.65     # Imbalance >= 0.65 → trending
+    FLOW_TREND_THRESHOLD = 0.75     # Imbalance >= 0.75 → trending (BONUS: 0.65→0.75)
 
     # --- Trend following ---
     TREND_TAKE_PROFIT_BPS = 15.0    # TP quand prix bouge de 15 bps en notre faveur
     TREND_STOP_LOSS_BPS = 8.0       # SL quand prix bouge de 8 bps contre nous
-    TREND_MAX_DURATION_SEC = 120.0  # Max durée d'une position trend
-    TREND_ENTRY_TIMEOUT_SEC = 15.0  # Timeout pour fill l'entry order
+    TREND_MAX_DURATION_SEC = 90.0   # Max durée d'une position trend (BONUS: 120→90)
+    TREND_ENTRY_TIMEOUT_SEC = 10.0  # Timeout pour fill l'entry order (BONUS: 15→10)
 
     # --- Stop-loss ---
     STOP_LOSS_USD = 0.30            # Perte max par position avant emergency
@@ -363,6 +363,9 @@ class PairMarketMakerV2:
         self._trend_last_add_time: float = 0.0
         self._trend_trailing_stop: float = 0.0   # Prix du trailing stop
 
+        # Anti-churn: cooldown after trend exit
+        self._last_trend_exit: float = 0.0
+
     # =====================================================================
     # Main loop — event-driven
     # =====================================================================
@@ -421,8 +424,9 @@ class PairMarketMakerV2:
         if not self.dry_run and self._cycle_count % 3 == 0:
             await self._check_fills(mid)
 
-        # 5. Refresh inventory
-        if not self.dry_run and self._cycle_count % 3 == 0:
+        # 5. Refresh inventory — BUG 3 FIX: every cycle when in position
+        in_position_state = self._state in ("TREND_FOLLOWING", "CLOSING", "EMERGENCY_CLOSE")
+        if not self.dry_run and (in_position_state or self._cycle_count % 3 == 0):
             inventory = await self._get_inventory()
             self._cached_inventory = inventory
             self._inventory_last_refresh = time.time()
@@ -430,8 +434,11 @@ class PairMarketMakerV2:
         inventory = self._cached_inventory
         inventory_usd = inventory * mid
 
-        # 6. Compute unrealized PnL from API entry price
-        unrealized = self.pnl.get_unrealized_pnl(mid)
+        # 6. BUG 3 FIX: Use API entry price for unrealized PnL when available
+        if self._cached_entry_price > 0 and abs(inventory) > 1e-12:
+            unrealized = inventory * (mid - self._cached_entry_price)
+        else:
+            unrealized = self.pnl.get_unrealized_pnl(mid)
 
         # 7. State machine dispatch
         if self._state == "MONITORING":
@@ -464,6 +471,21 @@ class PairMarketMakerV2:
         """MONITORING: Observer le flow, quoter ou trend-follow."""
         # Check emergency cooldown
         if time.time() < self._emergency_cooldown_until:
+            return
+
+        # BUG 1 FIX: Check existing inventory — if we already have a position,
+        # go to CLOSING instead of entering a new trend that could flip us
+        inventory_usd = abs(self._cached_inventory * mid)
+        if inventory_usd > 10.0:
+            self._state = "CLOSING"
+            self._closing_start = time.time()
+            self._log.info("state_change", new_state="CLOSING",
+                           reason="existing_inventory_in_monitoring",
+                           inventory_usd=round(inventory_usd, 2))
+            return
+
+        # BUG 5 FIX: Cooldown after trend exit — prevent rapid re-entry
+        if time.time() < self._last_trend_exit + 30.0:
             return
 
         # Classify flow regime
@@ -603,6 +625,7 @@ class PairMarketMakerV2:
             self._trend_add_count = 0
             self._trend_trailing_stop = 0.0
             self._trend_last_add_time = 0.0
+            self._last_trend_exit = time.time()  # BUG 5 FIX: cooldown
             self._log.info("state_change", new_state="MONITORING",
                            reason="position_closed")
             # Cancel any remaining close orders
@@ -689,6 +712,7 @@ class PairMarketMakerV2:
             self._trend_add_count = 0
             self._trend_trailing_stop = 0.0
             self._trend_last_add_time = 0.0
+            self._last_trend_exit = time.time()  # BUG 5 FIX: cooldown
             self._log.info("state_change", new_state="MONITORING",
                            reason="emergency_done", cooldown_sec=60)
             return
@@ -729,6 +753,7 @@ class PairMarketMakerV2:
         self._trend_add_count = 0
         self._trend_trailing_stop = 0.0
         self._trend_last_add_time = 0.0
+        self._last_trend_exit = time.time()  # BUG 5 FIX: cooldown
         self._cached_inventory = 0.0
 
     # =====================================================================
@@ -737,6 +762,17 @@ class PairMarketMakerV2:
 
     async def _enter_trend_position(self, mid: float, direction: str) -> None:
         """Place un limit order agressif pour entrer en position trend."""
+        # BUG 4 FIX: Max inventory guard — don't enter if already near max
+        current_inv_usd = abs(self._cached_inventory * mid)
+        if current_inv_usd + self.config.order_size_usd > self.config.max_inventory_usd:
+            self._log.warning("trend_entry_blocked_max_inventory",
+                              current_inv_usd=round(current_inv_usd, 2),
+                              max=self.config.max_inventory_usd)
+            self._state = "MONITORING"
+            self._safe_since = 0
+            self._trend_direction = ""
+            return
+
         if self.dry_run:
             self._trend_entry_price = mid
             self._log.info("dry_trend_entry", direction=direction, mid=round(mid, 4))
@@ -745,12 +781,14 @@ class PairMarketMakerV2:
         coin = self.config.coin
         sz = self.config.order_size_usd / mid
 
-        # Limit à 2 bps du mid pour fill rapide
+        # BUG 2 FIX: Use post_only=True (ALO maker order) to get rebate
+        # instead of paying taker fees. Place limit below mid for buy,
+        # above mid for sell — passive entry at 2 bps inside.
         if direction == "long":
-            price = mid * (1 + 2.0 / 10_000)
+            price = mid * (1 - 2.0 / 10_000)  # Bid below mid
             is_buy = True
         else:
-            price = mid * (1 - 2.0 / 10_000)
+            price = mid * (1 + 2.0 / 10_000)  # Ask above mid
             is_buy = False
 
         price = self._round_price(price)
@@ -765,7 +803,7 @@ class PairMarketMakerV2:
                 "is_buy": is_buy,
                 "size": sz,
                 "price": price,
-                "post_only": False,  # GTC, on veut le fill
+                "post_only": True,  # BUG 2 FIX: ALO maker for rebate
             }
             results = await self.client.place_bulk_orders([order])
 
@@ -825,6 +863,7 @@ class PairMarketMakerV2:
                 self._trend_add_count = 0
                 self._trend_trailing_stop = 0.0
                 self._trend_last_add_time = 0.0
+                self._last_trend_exit = time.time()  # BUG 5 FIX: cooldown
                 self._log.info("trend_entry_timeout", elapsed=round(elapsed, 1))
                 return
 
@@ -923,6 +962,8 @@ class PairMarketMakerV2:
             and now - self._trend_last_add_time > 10.0  # Min 10s entre ajouts
             and abs(inventory_usd) > 5.0  # On a déjà une position initiale
             and move_bps > 5.0  # Position actuelle en profit d'au moins 5 bps
+            # BUG 4 FIX: Max inventory guard for pyramiding
+            and abs(inventory_usd) + cfg.order_size_usd < cfg.max_inventory_usd
         )
 
         if can_add:
@@ -957,6 +998,14 @@ class PairMarketMakerV2:
                     if results and results[0].success:
                         self._trend_add_count += 1
                         self._trend_last_add_time = now
+
+                        # BUG 6 FIX: Track pyramid order in _current_orders
+                        self._current_orders.append({
+                            "oid": results[0].oid,
+                            "is_buy": add_order["is_buy"],
+                            "price": add_order["price"],
+                            "size": add_order["size"],
+                        })
 
                         # Trailing stop: remonter au entry du dernier ajout - 5 bps
                         if self._trend_direction == "long":
