@@ -168,9 +168,9 @@ class PairMarketMakerV2:
     MAX_SPREAD_BPS = 50.0           # Spread plafond
     
     # --- Paramètres event-driven ---
-    POLL_INTERVAL_SEC = 1.0         # Fréquence de lecture du prix
-    REQUOTE_THRESHOLD_BPS = 3.0     # Seuil de mouvement pour requoter
-    FORCE_REQUOTE_SEC = 15.0        # Requote forcé après X secondes même sans mouvement
+    POLL_INTERVAL_SEC = 5.0         # Fréquence de lecture du prix
+    REQUOTE_THRESHOLD_BPS = 4.0     # Seuil de mouvement pour requoter
+    FORCE_REQUOTE_SEC = 60.0        # Requote forcé après X secondes même sans mouvement
     
     # --- Paramètres trend/protection ---
     TREND_WINDOW_SEC = 60.0
@@ -211,6 +211,11 @@ class PairMarketMakerV2:
         self._last_quoted_mid: float = 0.0
         self._last_quote_time: float = 0.0
         self._cycle_count: int = 0
+        self._tp_cooldown_until: float = 0.0  # Cooldown pour take_profit après échec
+
+        # Cache inventaire (refresh seulement lors du requote complet)
+        self._cached_inventory: float = 0.0
+        self._inventory_last_refresh: float = 0.0
     
     # =====================================================================
     # Main loop — event-driven
@@ -249,48 +254,48 @@ class PairMarketMakerV2:
         """Cycle rapide: lire le prix, décider si on requote."""
         coin = self.config.coin
         self._cycle_count += 1
-        
+
         # 1. UN SEUL appel API: L2 book (donne mid + bid/ask + profondeur)
         l2 = await self.client.get_l2_book(coin, n_levels=5)
         mid, best_bid, best_ask, bid_depth, ask_depth = self._book.parse_l2(l2)
-        
+
         if mid <= 0 or best_bid <= 0 or best_ask <= 0:
             return
-        
+
         # 2. Enregistrer le prix
         self._vol.record(mid)
         self._price_history.append((time.time(), mid))
-        
-        # 3. Check fills (chaque cycle pour ne pas rater)
-        if not self.dry_run:
+
+        # 3. Check fills (seulement tous les 3 cycles pour économiser les appels)
+        if not self.dry_run and self._cycle_count % 3 == 0:
             await self._check_fills(mid)
-        
+
         # 4. Décider si on doit requoter
         now = time.time()
         mid_moved_bps = 0.0
         if self._last_quoted_mid > 0:
             mid_moved_bps = abs(mid - self._last_quoted_mid) / self._last_quoted_mid * 10_000
-        
+
         time_since_last = now - self._last_quote_time
-        
+
         needs_requote = (
             self._last_quoted_mid == 0                              # Premier cycle
             or mid_moved_bps >= self.REQUOTE_THRESHOLD_BPS          # Prix a bougé
             or time_since_last >= self.FORCE_REQUOTE_SEC            # Timeout
         )
-        
+
         if needs_requote:
             await self._full_requote(mid, best_bid, best_ask, bid_depth, ask_depth)
             self._last_quoted_mid = mid
             self._last_quote_time = now
-        
-        # 5. Take-profit check (moins fréquent)
-        if not self.dry_run and self._cycle_count % 3 == 0:
-            inventory = await self._get_inventory()
-            await self._check_take_profit(mid, inventory)
-        
-        # 6. Update state pour le dashboard (chaque cycle)
-        self._update_state(mid, best_bid, best_ask)
+
+        # 5. Take-profit check (tous les 10 cycles au lieu de 3)
+        if not self.dry_run and self._cycle_count % 10 == 0:
+            await self._check_take_profit(mid, self._cached_inventory)
+
+        # 6. Update state pour le dashboard (seulement si requote ou tous les 5 cycles)
+        if needs_requote or self._cycle_count % 5 == 0:
+            self._update_state(mid, best_bid, best_ask)
     
     async def _full_requote(
         self, mid: float, best_bid: float, best_ask: float,
@@ -298,9 +303,11 @@ class PairMarketMakerV2:
     ) -> None:
         """Recalcule et place de nouvelles quotes."""
         coin = self.config.coin
-        
-        # --- Inventaire ---
+
+        # --- Inventaire (refresh et cache) ---
         inventory = await self._get_inventory()
+        self._cached_inventory = inventory  # Cache pour éviter les appels répétés
+        self._inventory_last_refresh = time.time()
         inventory_usd = inventory * mid
         
         # --- Signaux micro-structure ---
@@ -715,19 +722,23 @@ class PairMarketMakerV2:
     
     async def _check_take_profit(self, mid_price: float, inventory: float) -> bool:
         """Vérifie si on doit prendre le profit."""
+        # Check cooldown après échec
+        if time.time() < self._tp_cooldown_until:
+            return False
+
         if not self.config.take_profit_enabled or self.dry_run:
             return False
-        
+
         inventory_usd = abs(inventory * mid_price)
         if inventory_usd < 5.0:
             return False
-        
+
         unrealized = self.pnl.get_unrealized_pnl(mid_price)
         threshold_usd = max(
             self.config.take_profit_min_usd,
             inventory_usd * self.config.take_profit_pct / 100.0,
         )
-        
+
         if unrealized >= threshold_usd:
             self._log.info(
                 "take_profit_triggered",
@@ -735,31 +746,36 @@ class PairMarketMakerV2:
                 inventory=round(inventory, 4),
                 unrealized_pnl=round(unrealized, 4),
             )
-            
+
             try:
                 await self.client.cancel_coin_orders(self.config.coin)
                 self._current_orders = []
-                
+
                 is_buy = inventory < 0
                 size = abs(inventory)
-                
+
                 result = await self.client.market_order(
                     coin=self.config.coin,
                     is_buy=is_buy,
                     size=size,
                     reduce_only=True,
                 )
-                
+
                 if result.success:
                     self._log.info("take_profit_executed", coin=self.config.coin,
                                  side="buy" if is_buy else "sell", size=round(size, 4))
                     self._last_quote_time = 0  # Force requote
                     return True
                 else:
-                    self._log.warning("take_profit_failed", error=result.error)
+                    # Échec → activer le cooldown de 5 minutes
+                    self._tp_cooldown_until = time.time() + 300
+                    self._log.warning("take_profit_failed", error=result.error,
+                                    cooldown_sec=300)
             except Exception as e:
-                self._log.error("take_profit_error", error=str(e))
-        
+                # Exception → activer le cooldown de 5 minutes
+                self._tp_cooldown_until = time.time() + 300
+                self._log.error("take_profit_error", error=str(e), cooldown_sec=300)
+
         return False
     
     # =====================================================================
