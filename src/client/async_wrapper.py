@@ -92,3 +92,6 @@ class AsyncHyperliquidClient:
 
     async def get_funding_rate(self, coin: str) -> float:
         return await self._run(self._sync.get_funding_rate, coin)
+
+    async def get_recent_market_trades(self, coin: str, count: int = 50) -> list[dict]:
+        return await self._run(self._sync.get_recent_market_trades, coin, count)

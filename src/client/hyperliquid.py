@@ -402,3 +402,20 @@ class HyperliquidClient:
     def cancel_coin_orders(self, coin: str) -> bool:
         """Annule tous les ordres d'un coin."""
         return self.cancel_all(coin)
+
+    def get_recent_market_trades(self, coin: str, count: int = 50) -> list[dict]:
+        """Récupère les trades récents du marché via l'API info."""
+        import requests
+        base_url = constants.MAINNET_API_URL if self.mainnet else constants.TESTNET_API_URL
+        try:
+            resp = requests.post(
+                base_url + "/info",
+                json={"type": "recentTrades", "coin": coin},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                trades = resp.json()
+                return trades[-count:] if len(trades) > count else trades
+        except Exception:
+            pass
+        return []

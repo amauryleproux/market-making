@@ -1,19 +1,20 @@
-"""Stratégie de Market Making V2 — Event-driven + Avellaneda-Stoikov.
+"""Stratégie de Market Making V3 — Smart Quoting avec State Machine.
 
-Changements majeurs vs V1:
-- Event-driven: poll rapide (5s), requote seulement quand le mid bouge
-- 1 seul appel API L2 pour mid + bid/ask + book imbalance
+Le bot ne quote PAS en permanence. Il analyse le flow en temps réel
+et ne place des ordres que quand les conditions sont safe.
+
+State machine:
+- MONITORING: Observe le flow, aucune quote. Attend flow safe 5s.
+- QUOTING: Quotes actives. Pull si flow toxique ou si fill détecté.
+- CLOSING: Inventaire à fermer. Ordres close tight uniquement.
+- EMERGENCY_CLOSE: Stop-loss market, puis cooldown 60s.
+
+Features conservées du V2:
 - Spread dynamique Avellaneda-Stoikov en espace bps
-- Reservation price: mid ajusté par inventaire et funding
-- Order flow imbalance du L2 book pour détecter l'adverse selection
-- Smart cancel/replace: ne touche aux ordres que si prix changé > seuil
-- Anti-flip protection: empêche les position flips
-- Post-fill cooldown: 4s de pause avant de requoter après un fill
-- Take-profit en limit post_only au lieu de market order
-- Funding rate bias: collecte le funding en biaisant la position
-- Asymmetric sizing: accélère le retour à flat
-- Aggressive profit-taking: tight close orders when unrealized PnL is high
-- Stop-loss per position: market close + 60s cooldown if loss > $0.30
+- Reservation price (mid ajusté par inventaire + funding)
+- Smart cancel/replace
+- Anti-flip protection
+- Asymmetric sizing
 """
 
 import asyncio
@@ -133,11 +134,7 @@ class BookAnalyzer:
 
     @staticmethod
     def get_imbalance(bid_depth: float, ask_depth: float) -> float:
-        """Book imbalance: +1 = all bids, -1 = all asks, 0 = balanced.
-
-        Positif = pression acheteuse (plus de bids que d'asks).
-        Le prix devrait monter → on peut skewer les asks plus près.
-        """
+        """Book imbalance: +1 = all bids, -1 = all asks, 0 = balanced."""
         total = bid_depth + ask_depth
         if total < 1e-6:
             return 0.0
@@ -146,16 +143,80 @@ class BookAnalyzer:
     @staticmethod
     def get_microprice(best_bid: float, best_ask: float,
                        bid_size: float, ask_size: float) -> float:
-        """Micro-price pondéré par les tailles au best.
-
-        Plus informatif que le mid-price: si le bid a plus de volume,
-        le "vrai" prix est plus proche de l'ask.
-        """
+        """Micro-price pondéré par les tailles au best."""
         total = bid_size + ask_size
         if total < 1e-12:
             return (best_bid + best_ask) / 2.0
-        # Pondération inversée: gros bid → prix tiré vers ask
         return (best_bid * ask_size + best_ask * bid_size) / total
+
+
+class FlowAnalyzer:
+    """Analyse les trades récents pour détecter le flow toxique.
+
+    Flow toxique = les trades récents sont majoritairement dans une direction,
+    indiquant la présence de traders informés / momentum.
+    Flow safe = les trades sont équilibrés (bruit, retail).
+    """
+
+    def __init__(self, window_sec: float = 30.0):
+        self._window_sec = window_sec
+        self._trades: deque[tuple[float, str, float]] = deque(maxlen=200)
+        # (timestamp, side "buy"/"sell", size_usd)
+
+    def record_trade(self, side: str, size_usd: float) -> None:
+        """Enregistre un trade observé sur le marché."""
+        self._trades.append((time.time(), side, size_usd))
+
+    def get_flow_imbalance(self) -> float:
+        """Retourne l'imbalance du flow sur la fenêtre.
+
+        +1.0 = tout le volume est acheteur
+        -1.0 = tout le volume est vendeur
+        0.0 = équilibré
+        """
+        cutoff = time.time() - self._window_sec
+        recent = [(s, v) for t, s, v in self._trades if t >= cutoff]
+
+        if not recent:
+            return 0.0
+
+        buy_vol = sum(v for s, v in recent if s == "buy")
+        sell_vol = sum(v for s, v in recent if s == "sell")
+        total = buy_vol + sell_vol
+
+        if total < 1e-6:
+            return 0.0
+
+        return (buy_vol - sell_vol) / total
+
+    def get_trade_intensity(self) -> float:
+        """Nombre de trades par seconde sur la fenêtre."""
+        cutoff = time.time() - self._window_sec
+        recent = [t for t, _, _ in self._trades if t >= cutoff]
+
+        if len(recent) < 2:
+            return 0.0
+
+        return len(recent) / self._window_sec
+
+    def is_safe_to_quote(self) -> tuple[bool, str]:
+        """Détermine si les conditions sont safe pour quoter.
+
+        Returns:
+            (is_safe, reason)
+        """
+        imbalance = self.get_flow_imbalance()
+        intensity = self.get_trade_intensity()
+
+        # Flow très déséquilibré (> 70% dans une direction)
+        if abs(imbalance) > 0.7:
+            return False, f"toxic_flow_imbalance={imbalance:.2f}"
+
+        # Très haute intensité de trades + déséquilibre modéré
+        if intensity > 3.0 and abs(imbalance) > 0.5:
+            return False, f"high_intensity={intensity:.1f}_imbalance={imbalance:.2f}"
+
+        return True, "safe"
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +224,7 @@ class BookAnalyzer:
 # ---------------------------------------------------------------------------
 
 class PairMarketMakerV2:
-    """Market maker V2 — event-driven avec spread dynamique AS.
+    """Market maker V3 — Smart Quoting avec state machine.
 
     Compatible avec MMEngine (même interface que PairMarketMaker).
     """
@@ -185,6 +246,9 @@ class PairMarketMakerV2:
 
     # --- Imbalance ---
     IMBALANCE_SKEW_FACTOR = 0.3     # Pondération de l'imbalance sur le skew
+
+    # --- Flow safety ---
+    SAFE_FLOW_WAIT_SEC = 5.0        # Secondes de flow safe avant de quoter
 
     def __init__(
         self,
@@ -208,6 +272,8 @@ class PairMarketMakerV2:
         # Micro-structure components
         self._vol = VolatilityEstimator(window_sec=120.0, max_samples=500)
         self._book = BookAnalyzer()
+        self._flow = FlowAnalyzer(window_sec=30.0)
+        self._seen_market_trades: set = set()
 
         # Trend detector (prix sur fenêtre glissante)
         self._price_history: deque[tuple[float, float]] = deque(maxlen=300)
@@ -222,20 +288,18 @@ class PairMarketMakerV2:
         self._cached_inventory: float = 0.0
         self._inventory_last_refresh: float = 0.0
 
-        # Post-fill cooldown (Fix 2)
-        self._fill_cooldown_until: float = 0.0
-
-        # Pending take-profit limit order (Fix 3)
-        self._pending_tp_order: Optional[dict] = None
-        self._pending_tp_time: float = 0.0
-        self._tp_cooldown_until: float = 0.0  # Cooldown pour take_profit après échec
-
-        # Cached funding rate (Fix 5) — refreshed every 60s
+        # Cached funding rate — refreshed every 60s
         self._cached_funding: float = 0.0
         self._funding_fetch_time: float = 0.0
 
-        # Stop-loss cooldown (Fix 9)
-        self._stop_loss_cooldown_until: float = 0.0
+        # Entry price from API
+        self._cached_entry_price: float = 0.0
+
+        # State machine
+        self._state: str = "MONITORING"
+        self._safe_since: float = 0.0       # Timestamp flow safe continu
+        self._closing_start: float = 0.0     # Quand on est entré en CLOSING
+        self._emergency_cooldown_until: float = 0.0
 
     # =====================================================================
     # Main loop — event-driven
@@ -243,7 +307,8 @@ class PairMarketMakerV2:
 
     async def run(self) -> None:
         """Boucle principale event-driven."""
-        self._log.info("v2_started", coin=self.config.coin, dry_run=self.dry_run)
+        self._log.info("v2_started", coin=self.config.coin, dry_run=self.dry_run,
+                       mode="smart_quoting")
 
         await asyncio.sleep(random.uniform(0, 1.0))
 
@@ -271,7 +336,7 @@ class PairMarketMakerV2:
         self.state.is_running = False
 
     async def _fast_cycle(self) -> None:
-        """Cycle rapide: lire le prix, décider si on requote."""
+        """Cycle rapide: lire le marché, state machine."""
         coin = self.config.coin
         self._cycle_count += 1
 
@@ -286,66 +351,284 @@ class PairMarketMakerV2:
         self._vol.record(mid)
         self._price_history.append((time.time(), mid))
 
-        # 2b. Stop-loss cooldown (Fix 9): skip everything except price polling
-        now = time.time()
-        if now < self._stop_loss_cooldown_until:
-            self._update_state(mid, best_bid, best_ask)
-            return
+        # 3. Récupérer et analyser les trades du marché (tous les 2 cycles)
+        if self._cycle_count % 2 == 0:
+            try:
+                market_trades = await self.client.get_recent_market_trades(coin, 50)
+                for t in market_trades:
+                    trade_id = (t.get("tid", ""), t.get("time", ""))
+                    if trade_id not in self._seen_market_trades:
+                        self._seen_market_trades.add(trade_id)
+                        side = "buy" if t.get("side") == "B" else "sell"
+                        size_usd = float(t.get("px", 0)) * float(t.get("sz", 0))
+                        self._flow.record_trade(side, size_usd)
+            except Exception:
+                pass
+            # Trim seen trades set to prevent unbounded growth
+            if len(self._seen_market_trades) > 500:
+                self._seen_market_trades = set(list(self._seen_market_trades)[-200:])
 
-        # 2c. Stop-loss check (Fix 9): close position if loss > $0.30
-        if not self.dry_run and abs(self._cached_inventory) > 1e-12:
-            unrealized = self.pnl.get_unrealized_pnl(mid)
-            if unrealized < -0.30:
-                await self._execute_stop_loss(mid, self._cached_inventory, unrealized)
-                return
-
-        # 3. Check fills (seulement tous les 3 cycles pour économiser les appels)
+        # 4. Check fills (tous les 3 cycles)
         if not self.dry_run and self._cycle_count % 3 == 0:
             await self._check_fills(mid)
 
-        # 4. Décider si on doit requoter
+        # 5. Refresh inventory
+        if not self.dry_run and self._cycle_count % 3 == 0:
+            inventory = await self._get_inventory()
+            self._cached_inventory = inventory
+            self._inventory_last_refresh = time.time()
+
+        inventory = self._cached_inventory
+        inventory_usd = inventory * mid
+
+        # 6. Compute unrealized PnL from API entry price
+        unrealized = self.pnl.get_unrealized_pnl(mid)
+
+        # 7. State machine dispatch
+        if self._state == "MONITORING":
+            await self._handle_monitoring(mid, best_bid, best_ask, bid_depth, ask_depth)
+        elif self._state == "QUOTING":
+            await self._handle_quoting(mid, best_bid, best_ask, bid_depth, ask_depth,
+                                       inventory, inventory_usd, unrealized)
+        elif self._state == "CLOSING":
+            await self._handle_closing(mid, inventory, inventory_usd, unrealized)
+        elif self._state == "EMERGENCY_CLOSE":
+            await self._handle_emergency(mid, inventory)
+
+        # 8. Update state pour le dashboard
+        self._update_state(mid, best_bid, best_ask)
+
+        # 9. Snapshot DB (pas chaque cycle)
+        if self._cycle_count % 5 == 0:
+            await self._log_snapshot(mid, best_bid, best_ask, inventory, inventory_usd)
+
+    # =====================================================================
+    # State machine handlers
+    # =====================================================================
+
+    async def _handle_monitoring(
+        self, mid: float, best_bid: float, best_ask: float,
+        bid_depth: float, ask_depth: float,
+    ) -> None:
+        """MONITORING: Observer le flow, quoter quand c'est safe."""
+        # Check emergency cooldown
+        if time.time() < self._emergency_cooldown_until:
+            return
+
+        is_safe, reason = self._flow.is_safe_to_quote()
+
+        if is_safe:
+            if self._safe_since == 0:
+                self._safe_since = time.time()
+            # Attendre N secondes de flow safe avant de quoter
+            if time.time() - self._safe_since >= self.SAFE_FLOW_WAIT_SEC:
+                self._state = "QUOTING"
+                self._log.info("state_change", new_state="QUOTING", reason="flow_safe")
+                # Place les quotes immédiatement
+                await self._full_requote(mid, best_bid, best_ask, bid_depth, ask_depth)
+                self._last_quoted_mid = mid
+                self._last_quote_time = time.time()
+        else:
+            self._safe_since = 0  # Reset le timer
+            # S'assurer qu'il n'y a pas d'ordres dans le book
+            if self._current_orders and not self.dry_run:
+                try:
+                    await self.client.cancel_coin_orders(self.config.coin)
+                except Exception:
+                    pass
+                self._current_orders = []
+                self._log.info("quotes_pulled", reason=reason)
+
+    async def _handle_quoting(
+        self, mid: float, best_bid: float, best_ask: float,
+        bid_depth: float, ask_depth: float,
+        inventory: float, inventory_usd: float, unrealized: float,
+    ) -> None:
+        """QUOTING: Quotes actives. Surveiller le flow et les fills."""
+        # Check si le flow est devenu toxique
+        is_safe, reason = self._flow.is_safe_to_quote()
+        if not is_safe:
+            # Pull toutes les quotes
+            if not self.dry_run:
+                try:
+                    await self.client.cancel_coin_orders(self.config.coin)
+                except Exception:
+                    pass
+            self._current_orders = []
+            self._state = "MONITORING"
+            self._safe_since = 0
+            self._log.info("state_change", new_state="MONITORING", reason=reason)
+            return
+
+        # Check si on a été fill (inventaire non-nul)
+        if abs(inventory_usd) > 10.0:
+            self._state = "CLOSING"
+            self._closing_start = time.time()
+            self._log.info("state_change", new_state="CLOSING",
+                           inventory_usd=round(inventory_usd, 2))
+            # Cancel quotes normales immédiatement, on va placer des close orders
+            if not self.dry_run:
+                try:
+                    await self.client.cancel_coin_orders(self.config.coin)
+                except Exception:
+                    pass
+                self._current_orders = []
+            return
+
+        # Requote normal si nécessaire
         now = time.time()
         mid_moved_bps = 0.0
         if self._last_quoted_mid > 0:
             mid_moved_bps = abs(mid - self._last_quoted_mid) / self._last_quoted_mid * 10_000
 
-        time_since_last = now - self._last_quote_time
-
-        # Post-fill cooldown: keep polling price & fills but skip requote
-        in_cooldown = now < self._fill_cooldown_until
-
         needs_requote = (
-            self._last_quoted_mid == 0                              # Premier cycle
-            or mid_moved_bps >= self.REQUOTE_THRESHOLD_BPS          # Prix a bougé
-            or time_since_last >= self.FORCE_REQUOTE_SEC            # Timeout
+            self._last_quoted_mid == 0
+            or mid_moved_bps >= self.REQUOTE_THRESHOLD_BPS
+            or (now - self._last_quote_time) >= self.FORCE_REQUOTE_SEC
         )
 
-        if needs_requote and not in_cooldown and not self._pending_tp_order:
+        if needs_requote:
             await self._full_requote(mid, best_bid, best_ask, bid_depth, ask_depth)
             self._last_quoted_mid = mid
             self._last_quote_time = now
 
-        # 5. Pending TP order management
-        if not self.dry_run and self._pending_tp_order:
-            if time.time() - self._pending_tp_time > 10.0:
-                # TP order expired → cancel and resume normal quoting
-                self._log.info("tp_order_expired", coin=self.config.coin)
+    async def _handle_closing(
+        self, mid: float, inventory: float, inventory_usd: float,
+        unrealized: float,
+    ) -> None:
+        """CLOSING: Fermer la position en profit si possible."""
+        # STOP LOSS: si perte > $0.30, emergency close
+        if unrealized < -0.30:
+            self._state = "EMERGENCY_CLOSE"
+            self._log.info("state_change", new_state="EMERGENCY_CLOSE",
+                           unrealized=round(unrealized, 4))
+            return
+
+        # Si position fermée, retour en monitoring
+        if abs(inventory_usd) < 5.0:
+            self._state = "MONITORING"
+            self._safe_since = 0
+            self._log.info("state_change", new_state="MONITORING",
+                           reason="position_closed")
+            # Cancel any remaining close orders
+            if self._current_orders and not self.dry_run:
                 try:
                     await self.client.cancel_coin_orders(self.config.coin)
-                    self._current_orders = []
                 except Exception:
                     pass
-                self._pending_tp_order = None
-                self._pending_tp_time = 0
-                self._last_quote_time = 0  # Force requote next cycle
+                self._current_orders = []
+            return
 
-        # 6. Take-profit check (tous les 10 cycles, only if no pending TP)
-        if not self.dry_run and not self._pending_tp_order and self._cycle_count % 10 == 0:
-            await self._check_take_profit(mid, self._cached_inventory)
+        # Placer des ordres close tight
+        time_in_closing = time.time() - self._closing_start
 
-        # 7. Update state pour le dashboard (seulement si requote ou tous les 5 cycles)
-        if needs_requote or self._cycle_count % 5 == 0:
-            self._update_state(mid, best_bid, best_ask)
+        if unrealized > 0:
+            # En profit → close à 2 bps
+            close_spread_bps = 2.0
+        elif time_in_closing > 120:
+            # Timeout → élargir le close pour forcer la sortie
+            close_spread_bps = 5.0
+        else:
+            # Légère perte → close à 3 bps
+            close_spread_bps = 3.0
+
+        close_offset = close_spread_bps / 10_000
+
+        # Anti-flip: cap size to actual inventory
+        close_size = abs(inventory)
+
+        if inventory > 0:
+            # Long → sell to close
+            close_price = mid * (1 + close_offset)
+            close_price = self._round_price(close_price)
+            close_order = {
+                "coin": self.config.coin,
+                "is_buy": False,
+                "size": close_size,
+                "price": close_price,
+                "post_only": True,
+                "level": 0,
+            }
+        else:
+            # Short → buy to close
+            close_price = mid * (1 - close_offset)
+            close_price = self._round_price(close_price)
+            close_order = {
+                "coin": self.config.coin,
+                "is_buy": True,
+                "size": close_size,
+                "price": close_price,
+                "post_only": True,
+                "level": 0,
+            }
+
+        # Cancel et replace seulement si ordre a changé
+        if not self.dry_run and self._orders_changed([close_order]):
+            try:
+                await self.client.cancel_coin_orders(self.config.coin)
+            except Exception:
+                pass
+
+            results = await self.client.place_bulk_orders([close_order])
+            self._current_orders = []
+            if results and results[0].success:
+                self._current_orders = [{
+                    "oid": results[0].oid,
+                    "is_buy": close_order["is_buy"],
+                    "price": close_order["price"],
+                    "size": close_order["size"],
+                }]
+            self._log.info("close_order_placed",
+                           spread_bps=close_spread_bps,
+                           unrealized=round(unrealized, 4),
+                           time_in_closing=round(time_in_closing, 0))
+
+    async def _handle_emergency(self, mid: float, inventory: float) -> None:
+        """EMERGENCY_CLOSE: Fermer au market immédiatement."""
+        if abs(inventory) < 1e-12:
+            self._state = "MONITORING"
+            self._emergency_cooldown_until = time.time() + 60.0
+            self._safe_since = 0
+            self._log.info("state_change", new_state="MONITORING",
+                           reason="emergency_done", cooldown_sec=60)
+            return
+
+        coin = self.config.coin
+        self._log.warning(
+            "emergency_close",
+            coin=coin,
+            inventory=round(inventory, 6),
+            mid=round(mid, 4),
+        )
+
+        try:
+            await self.client.cancel_coin_orders(coin)
+            self._current_orders = []
+
+            is_buy = inventory < 0
+            size = abs(inventory)
+            result = await self.client.market_order(
+                coin=coin,
+                is_buy=is_buy,
+                size=size,
+                reduce_only=True,
+            )
+
+            if result.success:
+                self._log.info("emergency_close_done", size=round(size, 6))
+            else:
+                self._log.error("emergency_close_failed", error=result.error)
+        except Exception as e:
+            self._log.error("emergency_close_error", error=str(e))
+
+        self._state = "MONITORING"
+        self._emergency_cooldown_until = time.time() + 60.0
+        self._safe_since = 0
+        self._cached_inventory = 0.0
+
+    # =====================================================================
+    # Full requote (used in QUOTING state)
+    # =====================================================================
 
     async def _full_requote(
         self, mid: float, best_bid: float, best_ask: float,
@@ -372,23 +655,18 @@ class PairMarketMakerV2:
         reservation_mid = self._compute_reservation_price(mid, inventory)
 
         # --- Application de l'imbalance ---
-        # Si imbalance positif (plus de bids), le prix va monter
-        # → on peut acheter un peu plus cher / vendre un peu plus cher
         imbalance_shift = imbalance * self.IMBALANCE_SKEW_FACTOR * spread_bps / 10_000 * mid
         reservation_mid += imbalance_shift
 
-        # --- Funding rate bias (Fix 5) ---
-        # Refresh funding toutes les 60s pour ne pas spammer l'API
+        # --- Funding rate bias ---
         now = time.time()
         if now - self._funding_fetch_time > 60.0:
             try:
                 self._cached_funding = await self.client.get_funding_rate(coin)
                 self._funding_fetch_time = now
             except Exception:
-                pass  # keep cached value
+                pass
 
-        # funding > 0.005% → longs payent → biaiser short (mid up)
-        # funding < -0.005% → shorts payent → biaiser long (mid down)
         if abs(self._cached_funding) > 0.00005:
             funding_shift_bps = self._cached_funding * 10_000 * 0.5
             reservation_mid += funding_shift_bps / 10_000 * mid
@@ -414,7 +692,6 @@ class PairMarketMakerV2:
 
         # --- Smart cancel/replace ---
         if not self.dry_run:
-            # Vérifier si les ordres ont changé significativement
             if self._orders_changed(orders):
                 await self.client.cancel_coin_orders(coin)
 
@@ -467,11 +744,11 @@ class PairMarketMakerV2:
                         trend_bps=round(trend_bps, 1),
                         inventory_usd=round(inventory_usd, 2),
                         mode=quoting_mode,
+                        state=self._state,
                     )
                 else:
                     self._current_orders = []
         else:
-            # Dry run logging
             for o in orders:
                 side = "BID" if o["is_buy"] else "ASK"
                 self._log.info("dry_order", coin=coin, side=side,
@@ -481,43 +758,21 @@ class PairMarketMakerV2:
         self.state.spread_bps = round(spread_bps, 1)
         self.state.trend_signal = round(trend_bps, 1)
         self.state.volatility_mult = round(sigma_bps, 1)
-        self.state.quoting_mode = quoting_mode
+        self.state.quoting_mode = self._state
         self.state.active_bids = sum(1 for o in orders if o["is_buy"])
         self.state.active_asks = sum(1 for o in orders if not o["is_buy"])
-
-        # Snapshot DB (pas chaque cycle, trop de writes)
-        if self._cycle_count % 5 == 0:
-            unrealized = self.pnl.get_unrealized_pnl(mid)
-            realized = self.pnl.state.realized_pnl
-            total = self.pnl.get_total_pnl(mid)
-            await self.db.log_snapshot(
-                pair=coin, mid_price=mid, best_bid=best_bid, best_ask=best_ask,
-                spread_bps=((best_ask - best_bid) / mid) * 10_000,
-                inventory=inventory, inventory_usd=inventory_usd,
-                unrealized_pnl=unrealized, realized_pnl=realized, total_pnl=total,
-            )
 
     # =====================================================================
     # Avellaneda-Stoikov spread computation
     # =====================================================================
 
     def _compute_as_spread(self) -> float:
-        """Calcule le spread optimal AS en bps.
-
-        Formule simplifiée en espace bps:
-            spread = base_spread + gamma * sigma_bps²
-
-        Plus la volatilité est haute, plus on élargit le spread.
-        Travaille directement en bps pour éviter les problèmes de calibration.
-        """
+        """Calcule le spread optimal AS en bps."""
         sigma_bps = self._vol.get_sigma_bps()
 
         if sigma_bps < 0.5:
-            # Pas assez de données → fallback au spread configuré
             return self.config.spread_bps
 
-        # Formule AS en bps: spread = base + gamma * sigma_bps²
-        # Plus la vol est haute, plus on élargit
         base_spread = self.config.spread_bps
         vol_adjustment = self.GAMMA * sigma_bps * sigma_bps
 
@@ -527,31 +782,22 @@ class PairMarketMakerV2:
     def _compute_reservation_price(
         self, mid: float, inventory: float,
     ) -> float:
-        """Calcule le reservation price (mid ajusté par l'inventaire).
-
-        Formule AS en bps: skew = q * gamma * sigma_bps²
-
-        q > 0 (long) → r < mid → on veut vendre → bids plus loin, asks plus près
-        q < 0 (short) → r > mid → on veut acheter → asks plus loin, bids plus près
-        """
+        """Calcule le reservation price (mid ajusté par l'inventaire)."""
         max_inv = self.config.max_inventory_usd
 
         if max_inv <= 0 or mid <= 0:
             return mid
 
-        # Normaliser q entre -1 et 1
         q_normalized = (inventory * mid) / max_inv
         q_normalized = max(-1.0, min(1.0, q_normalized))
 
         sigma_bps = self._vol.get_sigma_bps()
 
         if sigma_bps < 0.5:
-            # Fallback: skew linéaire classique
             skew_bps = q_normalized * self.config.spread_bps * self.config.inventory_skew_factor
         else:
-            # AS reservation: shift proportionnel à q * vol
             skew_bps = q_normalized * self.GAMMA * sigma_bps * sigma_bps
-            skew_bps = max(-20.0, min(20.0, skew_bps))  # cap à 20 bps
+            skew_bps = max(-20.0, min(20.0, skew_bps))
 
         return mid * (1 - skew_bps / 10_000)
 
@@ -574,78 +820,40 @@ class PairMarketMakerV2:
         max_inv = cfg.max_inventory_usd
         half_spread = spread_bps / 2.0 / 10_000
 
-        # ── Fix 7: Aggressive profit-taking via tight close orders ──
-        # When unrealized PnL is significant, tighten close side to lock profit
-        profit_taking_mode = False
-        close_only_mode = False
-
-        if abs(inventory_usd) > 10.0 and abs(inventory) > 1e-12:
-            unrealized = self.pnl.get_unrealized_pnl(mid)
-            threshold = abs(inventory_usd) * 0.003  # 0.3% of notional
-
-            if unrealized > threshold * 3:
-                # Strong profit: close-only mode at 1 bps from mid
-                close_only_mode = True
-                half_spread = 1.0 / 10_000
-                self.log.info(
-                    "close_only_mode",
-                    unrealized=round(unrealized, 4),
-                    threshold_3x=round(threshold * 3, 4),
-                    inventory_usd=round(inventory_usd, 2),
-                )
-            elif unrealized > threshold:
-                # Moderate profit: tight close at 2 bps, wide open at spread*1.5
-                profit_taking_mode = True
-                self.log.info(
-                    "profit_taking_mode",
-                    unrealized=round(unrealized, 4),
-                    threshold=round(threshold, 4),
-                    inventory_usd=round(inventory_usd, 2),
-                )
-
         # Trend protection multipliers
         bid_mult = 1.0
         ask_mult = 1.0
         allow_bids = True
         allow_asks = True
 
-        if close_only_mode:
-            # Only allow the close side
-            if inventory > 0:
-                allow_bids = False  # long → only asks to close
-            else:
-                allow_asks = False  # short → only bids to close
-        elif quoting_mode == "cautious":
+        if quoting_mode == "cautious":
             if trend_bps < 0:
-                bid_mult = 1.5  # prix baisse → bids plus loin
+                bid_mult = 1.5
             else:
-                ask_mult = 1.5  # prix monte → asks plus loin
+                ask_mult = 1.5
         elif quoting_mode == "one_sided":
             if trend_bps < 0:
                 allow_bids = False
             else:
                 allow_asks = False
 
-        # Hard inventory cutoff (skip in close-only mode, we want to close)
-        if not close_only_mode:
-            if inventory_usd >= max_inv:
-                allow_bids = False
-            elif inventory_usd <= -max_inv:
-                allow_asks = False
+        # Hard inventory cutoff
+        if inventory_usd >= max_inv:
+            allow_bids = False
+        elif inventory_usd <= -max_inv:
+            allow_asks = False
 
         orders = []
         sz_per_order = cfg.order_size_usd / mid
 
-        # Asymmetric sizing (Fix 6): accelerate return to flat
-        # Reduce side gets 1.5x, open side gets 0.7x when abs(inv) > $20
+        # Asymmetric sizing: accelerate return to flat
         open_sz = sz_per_order
         close_sz = sz_per_order
         if abs(inventory_usd) > 20.0:
             close_sz = sz_per_order * 1.5
             open_sz = sz_per_order * 0.7
 
-        # Anti-flip (Fix 1): cap reduce-side size to never flip position
-        # Applied AFTER asymmetric scaling
+        # Anti-flip: cap reduce-side size to never flip position
         if abs(inventory_usd) >= 5.0 and abs(inventory) > 1e-12:
             max_reduce = abs(inventory) / max(1, cfg.num_levels)
             close_sz = min(close_sz, max_reduce)
@@ -659,19 +867,8 @@ class PairMarketMakerV2:
             if allow_bids:
                 cumulative_buy_usd += cfg.order_size_usd
                 if abs(inventory_usd + cumulative_buy_usd) < max_inv:
-                    if close_only_mode:
-                        # Close-only: 1 bps from mid (already set in half_spread)
-                        bid_price = mid * (1 - half_spread)
-                    elif profit_taking_mode and inventory < 0:
-                        # Profit-taking: close side at 2 bps from mid
-                        bid_price = mid * (1 - 2.0 / 10_000)
-                    elif profit_taking_mode and inventory >= 0:
-                        # Profit-taking: open side at spread*1.5
-                        bid_price = reservation_mid * (1 - half_spread * 1.5 - level_offset)
-                    else:
-                        bid_price = reservation_mid * (1 - half_spread * bid_mult - level_offset)
+                    bid_price = reservation_mid * (1 - half_spread * bid_mult - level_offset)
                     bid_price = self._round_price(bid_price)
-                    # Short → bids = reduce/close side; Long/flat → bids = open side
                     bid_sz = close_sz if inventory < 0 else open_sz
                     orders.append({
                         "coin": cfg.coin,
@@ -685,19 +882,8 @@ class PairMarketMakerV2:
             if allow_asks:
                 cumulative_sell_usd += cfg.order_size_usd
                 if abs(inventory_usd - cumulative_sell_usd) < max_inv:
-                    if close_only_mode:
-                        # Close-only: 1 bps from mid (already set in half_spread)
-                        ask_price = mid * (1 + half_spread)
-                    elif profit_taking_mode and inventory > 0:
-                        # Profit-taking: close side at 2 bps from mid
-                        ask_price = mid * (1 + 2.0 / 10_000)
-                    elif profit_taking_mode and inventory <= 0:
-                        # Profit-taking: open side at spread*1.5
-                        ask_price = reservation_mid * (1 + half_spread * 1.5 + level_offset)
-                    else:
-                        ask_price = reservation_mid * (1 + half_spread * ask_mult + level_offset)
+                    ask_price = reservation_mid * (1 + half_spread * ask_mult + level_offset)
                     ask_price = self._round_price(ask_price)
-                    # Long → asks = reduce/close side; Short/flat → asks = open side
                     ask_sz = close_sz if inventory > 0 else open_sz
                     orders.append({
                         "coin": cfg.coin,
@@ -715,18 +901,13 @@ class PairMarketMakerV2:
     # =====================================================================
 
     def _orders_changed(self, new_orders: list[dict]) -> bool:
-        """Vérifie si les nouveaux ordres diffèrent significativement des actuels.
-
-        Évite les cancel/replace inutiles qui créent de la latence
-        et perdent la queue position.
-        """
+        """Vérifie si les nouveaux ordres diffèrent significativement des actuels."""
         if len(new_orders) != len(self._current_orders):
             return True
 
         if not self._current_orders:
             return True
 
-        # Trier par (is_buy, price) pour comparer
         old_sorted = sorted(self._current_orders, key=lambda o: (o["is_buy"], o["price"]))
         new_sorted = sorted(new_orders, key=lambda o: (o["is_buy"], o["price"]))
 
@@ -734,7 +915,6 @@ class PairMarketMakerV2:
             if old["is_buy"] != new["is_buy"]:
                 return True
 
-            # Vérifier si le prix a changé de plus de 1 bps
             if old["price"] > 0:
                 price_diff_bps = abs(old["price"] - new["price"]) / old["price"] * 10_000
                 if price_diff_bps > 1.0:
@@ -775,11 +955,11 @@ class PairMarketMakerV2:
         return total_move_bps
 
     # =====================================================================
-    # Inventory / Fills / Take-profit
+    # Inventory / Fills
     # =====================================================================
 
     async def _get_inventory(self) -> float:
-        """Récupère l'inventaire depuis l'API."""
+        """Récupère l'inventaire depuis l'API + cache entry_price."""
         if self.dry_run:
             return self.pnl.current_inventory
 
@@ -787,11 +967,13 @@ class PairMarketMakerV2:
             account = await self.client.get_account_state()
             for pos in account.positions:
                 if pos.coin == self.config.coin:
+                    self._cached_entry_price = pos.entry_px
                     return pos.size
-            return 0.0  # Pas de position trouvée = inventory 0
+            self._cached_entry_price = 0.0
+            return 0.0
         except Exception as e:
             self._log.warning("inventory_fetch_error", error=str(e))
-            return self.pnl.current_inventory  # Fallback uniquement si API fail
+            return self.pnl.current_inventory
 
     async def _check_fills(self, mid_price: float) -> None:
         """Poll les fills récents."""
@@ -840,148 +1022,11 @@ class PairMarketMakerV2:
                 size=size,
                 realized_delta=round(result["realized_pnl_delta"], 4),
                 inventory=round(result["inventory_after"], 6),
+                state=self._state,
             )
-
-            # Clear pending TP if this fill matches it
-            if (self._pending_tp_order and
-                    fill.get("oid") == self._pending_tp_order.get("oid")):
-                self._log.info("tp_order_filled", coin=self.config.coin,
-                             price=price, size=size)
-                self._pending_tp_order = None
-                self._pending_tp_time = 0
-
-            # Post-fill cooldown: laisser le prix se stabiliser avant de requoter
-            self._fill_cooldown_until = time.time() + 4.0
-            self._last_quote_time = 0  # Force requote après le cooldown
-
-    async def _execute_stop_loss(
-        self, mid: float, inventory: float, unrealized: float,
-    ) -> None:
-        """Fix 9: Stop-loss — ferme la position en market si perte > $0.30.
-
-        Cancel tous les ordres, market close, puis cooldown 60s.
-        """
-        coin = self.config.coin
-        self._log.warning(
-            "stop_loss_triggered",
-            coin=coin,
-            inventory=round(inventory, 6),
-            unrealized=round(unrealized, 4),
-            mid=round(mid, 4),
-        )
-
-        try:
-            # 1. Cancel tous les ordres
-            await self.client.cancel_coin_orders(coin)
-            self._current_orders = []
-            self._pending_tp_order = None
-            self._pending_tp_time = 0
-
-            # 2. Market order reduce_only pour fermer
-            is_buy = inventory < 0  # short → buy to close, long → sell to close
-            size = abs(inventory)
-
-            result = await self.client.market_order(
-                coin=coin,
-                is_buy=is_buy,
-                size=size,
-                reduce_only=True,
-            )
-
-            if result.success:
-                self._log.info(
-                    "stop_loss_closed",
-                    coin=coin,
-                    side="buy" if is_buy else "sell",
-                    size=round(size, 6),
-                )
-            else:
-                self._log.error("stop_loss_close_failed", error=result.error)
-
-        except Exception as e:
-            self._log.error("stop_loss_error", error=str(e))
-
-        # 3. Cooldown 60s — ne placer aucun ordre
-        self._stop_loss_cooldown_until = time.time() + 60.0
-        self._last_quote_time = 0  # Force requote after cooldown
-        self._cached_inventory = 0.0  # Reset cached inventory
-
-    async def _check_take_profit(self, mid_price: float, inventory: float) -> bool:
-        """Vérifie si on doit prendre le profit. Utilise un limit order post_only
-        au lieu d'un market order pour économiser ~3 bps (maker vs taker)."""
-        # Check cooldown après échec
-        if time.time() < self._tp_cooldown_until:
-            return False
-
-        if not self.config.take_profit_enabled or self.dry_run:
-            return False
-
-        inventory_usd = abs(inventory * mid_price)
-        if inventory_usd < 5.0:
-            return False
-
-        unrealized = self.pnl.get_unrealized_pnl(mid_price)
-        threshold_usd = max(
-            self.config.take_profit_min_usd,
-            inventory_usd * self.config.take_profit_pct / 100.0,
-        )
-
-        if unrealized >= threshold_usd:
-            self._log.info(
-                "take_profit_triggered",
-                coin=self.config.coin,
-                inventory=round(inventory, 4),
-                unrealized_pnl=round(unrealized, 4),
-            )
-
-            try:
-                await self.client.cancel_coin_orders(self.config.coin)
-                self._current_orders = []
-
-                is_buy = inventory < 0
-                size = abs(inventory)
-
-                # Limit order agressif à 1 bps du mid (maker fee au lieu de taker)
-                if is_buy:
-                    tp_price = mid_price * (1 - 1.0 / 10_000)  # 1 bps sous le mid
-                else:
-                    tp_price = mid_price * (1 + 1.0 / 10_000)  # 1 bps au-dessus du mid
-                tp_price = self._round_price(tp_price)
-
-                tp_order = {
-                    "coin": self.config.coin,
-                    "is_buy": is_buy,
-                    "size": size,
-                    "price": tp_price,
-                    "post_only": True,
-                }
-
-                results = await self.client.place_bulk_orders([tp_order])
-
-                if results and results[0].success:
-                    self._pending_tp_order = {
-                        "oid": results[0].oid,
-                        "is_buy": is_buy,
-                        "size": size,
-                        "price": tp_price,
-                    }
-                    self._pending_tp_time = time.time()
-                    self._log.info("tp_limit_placed", coin=self.config.coin,
-                                 side="buy" if is_buy else "sell",
-                                 price=tp_price, size=round(size, 4))
-                    return True
-                else:
-                    error = results[0].error if results else "no result"
-                    self._tp_cooldown_until = time.time() + 300
-                    self._log.warning("tp_limit_failed", error=error, cooldown_sec=300)
-            except Exception as e:
-                self._tp_cooldown_until = time.time() + 300
-                self._log.error("take_profit_error", error=str(e), cooldown_sec=300)
-
-        return False
 
     # =====================================================================
-    # State update
+    # State update & DB snapshot
     # =====================================================================
 
     def _update_state(self, mid: float, best_bid: float, best_ask: float) -> None:
@@ -1003,6 +1048,23 @@ class PairMarketMakerV2:
         self.state.total_pnl = round(total, 4)
         self.state.fills_count = self.pnl.fills_count
         self.state.last_update = time.time()
+        self.state.quoting_mode = self._state
+
+    async def _log_snapshot(
+        self, mid: float, best_bid: float, best_ask: float,
+        inventory: float, inventory_usd: float,
+    ) -> None:
+        """Log snapshot to DB."""
+        unrealized = self.pnl.get_unrealized_pnl(mid)
+        realized = self.pnl.state.realized_pnl
+        total = self.pnl.get_total_pnl(mid)
+        await self.db.log_snapshot(
+            pair=self.config.coin, mid_price=mid,
+            best_bid=best_bid, best_ask=best_ask,
+            spread_bps=((best_ask - best_bid) / mid) * 10_000,
+            inventory=inventory, inventory_usd=inventory_usd,
+            unrealized_pnl=unrealized, realized_pnl=realized, total_pnl=total,
+        )
 
     # =====================================================================
     # Helpers
