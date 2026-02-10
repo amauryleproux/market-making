@@ -12,6 +12,7 @@ Changements majeurs vs V1:
 - Take-profit en limit post_only au lieu de market order
 - Funding rate bias: collecte le funding en biaisant la position
 - Asymmetric sizing: accélère le retour à flat
+- Aggressive profit-taking: tight close orders when unrealized PnL is high
 """
 
 import asyncio
@@ -556,13 +557,48 @@ class PairMarketMakerV2:
         max_inv = cfg.max_inventory_usd
         half_spread = spread_bps / 2.0 / 10_000
 
+        # ── Fix 7: Aggressive profit-taking via tight close orders ──
+        # When unrealized PnL is significant, tighten close side to lock profit
+        profit_taking_mode = False
+        close_only_mode = False
+
+        if abs(inventory_usd) > 10.0 and abs(inventory) > 1e-12:
+            unrealized = self.pnl.get_unrealized_pnl(mid)
+            threshold = abs(inventory_usd) * 0.003  # 0.3% of notional
+
+            if unrealized > threshold * 3:
+                # Strong profit: close-only mode at 1 bps from mid
+                close_only_mode = True
+                half_spread = 1.0 / 10_000
+                self.log.info(
+                    "close_only_mode",
+                    unrealized=round(unrealized, 4),
+                    threshold_3x=round(threshold * 3, 4),
+                    inventory_usd=round(inventory_usd, 2),
+                )
+            elif unrealized > threshold:
+                # Moderate profit: tight close at 2 bps, wide open at spread*1.5
+                profit_taking_mode = True
+                self.log.info(
+                    "profit_taking_mode",
+                    unrealized=round(unrealized, 4),
+                    threshold=round(threshold, 4),
+                    inventory_usd=round(inventory_usd, 2),
+                )
+
         # Trend protection multipliers
         bid_mult = 1.0
         ask_mult = 1.0
         allow_bids = True
         allow_asks = True
 
-        if quoting_mode == "cautious":
+        if close_only_mode:
+            # Only allow the close side
+            if inventory > 0:
+                allow_bids = False  # long → only asks to close
+            else:
+                allow_asks = False  # short → only bids to close
+        elif quoting_mode == "cautious":
             if trend_bps < 0:
                 bid_mult = 1.5  # prix baisse → bids plus loin
             else:
@@ -573,11 +609,12 @@ class PairMarketMakerV2:
             else:
                 allow_asks = False
 
-        # Hard inventory cutoff
-        if inventory_usd >= max_inv:
-            allow_bids = False
-        elif inventory_usd <= -max_inv:
-            allow_asks = False
+        # Hard inventory cutoff (skip in close-only mode, we want to close)
+        if not close_only_mode:
+            if inventory_usd >= max_inv:
+                allow_bids = False
+            elif inventory_usd <= -max_inv:
+                allow_asks = False
 
         orders = []
         sz_per_order = cfg.order_size_usd / mid
@@ -605,7 +642,17 @@ class PairMarketMakerV2:
             if allow_bids:
                 cumulative_buy_usd += cfg.order_size_usd
                 if abs(inventory_usd + cumulative_buy_usd) < max_inv:
-                    bid_price = reservation_mid * (1 - half_spread * bid_mult - level_offset)
+                    if close_only_mode:
+                        # Close-only: 1 bps from mid (already set in half_spread)
+                        bid_price = mid * (1 - half_spread)
+                    elif profit_taking_mode and inventory < 0:
+                        # Profit-taking: close side at 2 bps from mid
+                        bid_price = mid * (1 - 2.0 / 10_000)
+                    elif profit_taking_mode and inventory >= 0:
+                        # Profit-taking: open side at spread*1.5
+                        bid_price = reservation_mid * (1 - half_spread * 1.5 - level_offset)
+                    else:
+                        bid_price = reservation_mid * (1 - half_spread * bid_mult - level_offset)
                     bid_price = self._round_price(bid_price)
                     # Short → bids = reduce/close side; Long/flat → bids = open side
                     bid_sz = close_sz if inventory < 0 else open_sz
@@ -621,7 +668,17 @@ class PairMarketMakerV2:
             if allow_asks:
                 cumulative_sell_usd += cfg.order_size_usd
                 if abs(inventory_usd - cumulative_sell_usd) < max_inv:
-                    ask_price = reservation_mid * (1 + half_spread * ask_mult + level_offset)
+                    if close_only_mode:
+                        # Close-only: 1 bps from mid (already set in half_spread)
+                        ask_price = mid * (1 + half_spread)
+                    elif profit_taking_mode and inventory > 0:
+                        # Profit-taking: close side at 2 bps from mid
+                        ask_price = mid * (1 + 2.0 / 10_000)
+                    elif profit_taking_mode and inventory <= 0:
+                        # Profit-taking: open side at spread*1.5
+                        ask_price = reservation_mid * (1 + half_spread * 1.5 + level_offset)
+                    else:
+                        ask_price = reservation_mid * (1 + half_spread * ask_mult + level_offset)
                     ask_price = self._round_price(ask_price)
                     # Long → asks = reduce/close side; Short/flat → asks = open side
                     ask_sz = close_sz if inventory > 0 else open_sz
