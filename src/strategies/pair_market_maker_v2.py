@@ -1,20 +1,24 @@
-"""Stratégie de Market Making V3 — Smart Quoting avec State Machine.
+"""Stratégie V3 — Hybrid Market Maker + Trend Follower.
 
-Le bot ne quote PAS en permanence. Il analyse le flow en temps réel
-et ne place des ordres que quand les conditions sont safe.
+Le bot analyse le flow en temps réel via FlowAnalyzer et adapte son
+comportement: market making quand le flow est calm, trend following
+quand le flow est directionnel.
 
 State machine:
-- MONITORING: Observe le flow, aucune quote. Attend flow safe 5s.
-- QUOTING: Quotes actives. Pull si flow toxique ou si fill détecté.
+- MONITORING: Observe le flow, aucune quote. Classify regime.
+- QUOTING: Quotes actives (flow calm). Pull si flow shift.
+- TREND_FOLLOWING: Position directionnelle (flow trending). TP/SL/timeout.
 - CLOSING: Inventaire à fermer. Ordres close tight uniquement.
 - EMERGENCY_CLOSE: Stop-loss market, puis cooldown 60s.
 
-Features conservées du V2:
+Features:
+- FlowAnalyzer: classify_regime() → calm / trending_up / trending_down
 - Spread dynamique Avellaneda-Stoikov en espace bps
 - Reservation price (mid ajusté par inventaire + funding)
 - Smart cancel/replace
 - Anti-flip protection
 - Asymmetric sizing
+- Trend entry via limit GTC à 2 bps, TP 15 bps, SL 8 bps
 """
 
 import asyncio
@@ -199,6 +203,37 @@ class FlowAnalyzer:
 
         return len(recent) / self._window_sec
 
+    def get_trade_count(self) -> int:
+        """Nombre de trades dans la fenêtre courante."""
+        cutoff = time.time() - self._window_sec
+        return sum(1 for t, _, _ in self._trades if t >= cutoff)
+
+    def classify_regime(self) -> tuple[str, float]:
+        """Classifie le régime de marché basé sur le flow.
+
+        Returns:
+            (regime, confidence)
+            regime: "calm", "trending_up", "trending_down"
+            confidence: 0.0 à 1.0
+        """
+        imbalance = self.get_flow_imbalance()
+        abs_imb = abs(imbalance)
+        count = self.get_trade_count()
+
+        # Pas assez de trades pour classifier
+        if count < 5:
+            return "calm", 0.0
+
+        if abs_imb >= 0.65:
+            regime = "trending_up" if imbalance > 0 else "trending_down"
+            confidence = min(1.0, abs_imb)
+            return regime, confidence
+        elif abs_imb < 0.5:
+            return "calm", 1.0 - abs_imb
+        else:
+            # Zone grise 0.5-0.65: calm mais faible confiance
+            return "calm", 0.3
+
     def is_safe_to_quote(self) -> tuple[bool, str]:
         """Détermine si les conditions sont safe pour quoter.
 
@@ -250,6 +285,22 @@ class PairMarketMakerV2:
     # --- Flow safety ---
     SAFE_FLOW_WAIT_SEC = 5.0        # Secondes de flow safe avant de quoter
 
+    # --- Flow regime thresholds ---
+    FLOW_CALM_THRESHOLD = 0.5       # Imbalance < 0.5 → calm
+    FLOW_TREND_THRESHOLD = 0.65     # Imbalance >= 0.65 → trending
+
+    # --- Trend following ---
+    TREND_TAKE_PROFIT_BPS = 15.0    # TP quand prix bouge de 15 bps en notre faveur
+    TREND_STOP_LOSS_BPS = 8.0       # SL quand prix bouge de 8 bps contre nous
+    TREND_MAX_DURATION_SEC = 120.0  # Max durée d'une position trend
+    TREND_ENTRY_TIMEOUT_SEC = 15.0  # Timeout pour fill l'entry order
+
+    # --- Stop-loss ---
+    STOP_LOSS_USD = 0.30            # Perte max par position avant emergency
+
+    # --- Closing ---
+    CLOSING_TIMEOUT_SEC = 120.0     # Timeout en CLOSING avant d'élargir le spread
+
     def __init__(
         self,
         config: PairConfig,
@@ -300,6 +351,11 @@ class PairMarketMakerV2:
         self._safe_since: float = 0.0       # Timestamp flow safe continu
         self._closing_start: float = 0.0     # Quand on est entré en CLOSING
         self._emergency_cooldown_until: float = 0.0
+
+        # Trend following state
+        self._trend_entry_price: float = 0.0
+        self._trend_direction: str = ""      # "long" ou "short"
+        self._trend_entry_time: float = 0.0
 
     # =====================================================================
     # Main loop — event-driven
@@ -353,20 +409,7 @@ class PairMarketMakerV2:
 
         # 3. Récupérer et analyser les trades du marché (tous les 2 cycles)
         if self._cycle_count % 2 == 0:
-            try:
-                market_trades = await self.client.get_recent_market_trades(coin, 50)
-                for t in market_trades:
-                    trade_id = (t.get("tid", ""), t.get("time", ""))
-                    if trade_id not in self._seen_market_trades:
-                        self._seen_market_trades.add(trade_id)
-                        side = "buy" if t.get("side") == "B" else "sell"
-                        size_usd = float(t.get("px", 0)) * float(t.get("sz", 0))
-                        self._flow.record_trade(side, size_usd)
-            except Exception:
-                pass
-            # Trim seen trades set to prevent unbounded growth
-            if len(self._seen_market_trades) > 500:
-                self._seen_market_trades = set(list(self._seen_market_trades)[-200:])
+            await self._update_flow()
 
         # 4. Check fills (tous les 3 cycles)
         if not self.dry_run and self._cycle_count % 3 == 0:
@@ -390,6 +433,8 @@ class PairMarketMakerV2:
         elif self._state == "QUOTING":
             await self._handle_quoting(mid, best_bid, best_ask, bid_depth, ask_depth,
                                        inventory, inventory_usd, unrealized)
+        elif self._state == "TREND_FOLLOWING":
+            await self._handle_trend_following(mid, inventory, inventory_usd, unrealized)
         elif self._state == "CLOSING":
             await self._handle_closing(mid, inventory, inventory_usd, unrealized)
         elif self._state == "EMERGENCY_CLOSE":
@@ -410,34 +455,47 @@ class PairMarketMakerV2:
         self, mid: float, best_bid: float, best_ask: float,
         bid_depth: float, ask_depth: float,
     ) -> None:
-        """MONITORING: Observer le flow, quoter quand c'est safe."""
+        """MONITORING: Observer le flow, quoter ou trend-follow."""
         # Check emergency cooldown
         if time.time() < self._emergency_cooldown_until:
             return
 
-        is_safe, reason = self._flow.is_safe_to_quote()
+        # Classify flow regime
+        regime, confidence = self._flow.classify_regime()
 
-        if is_safe:
+        if regime == "calm":
+            # Flow calm → wait for safe period then quote
             if self._safe_since == 0:
                 self._safe_since = time.time()
-            # Attendre N secondes de flow safe avant de quoter
             if time.time() - self._safe_since >= self.SAFE_FLOW_WAIT_SEC:
                 self._state = "QUOTING"
-                self._log.info("state_change", new_state="QUOTING", reason="flow_safe")
-                # Place les quotes immédiatement
+                self._log.info("state_change", new_state="QUOTING", reason="flow_calm")
                 await self._full_requote(mid, best_bid, best_ask, bid_depth, ask_depth)
                 self._last_quoted_mid = mid
                 self._last_quote_time = time.time()
+        elif regime in ("trending_up", "trending_down"):
+            # Trending flow → enter trend position
+            self._safe_since = 0
+            direction = "long" if regime == "trending_up" else "short"
+            self._state = "TREND_FOLLOWING"
+            self._trend_direction = direction
+            self._trend_entry_time = time.time()
+            self._trend_entry_price = 0.0  # Will be set on fill
+            self._log.info("state_change", new_state="TREND_FOLLOWING",
+                           direction=direction, confidence=round(confidence, 2),
+                           imbalance=round(self._flow.get_flow_imbalance(), 2))
+            # Enter position immediately
+            await self._enter_trend_position(mid, direction)
         else:
-            self._safe_since = 0  # Reset le timer
-            # S'assurer qu'il n'y a pas d'ordres dans le book
+            # Not safe yet, reset timer
+            self._safe_since = 0
+            # Cancel any stale orders
             if self._current_orders and not self.dry_run:
                 try:
                     await self.client.cancel_coin_orders(self.config.coin)
                 except Exception:
                     pass
                 self._current_orders = []
-                self._log.info("quotes_pulled", reason=reason)
 
     async def _handle_quoting(
         self, mid: float, best_bid: float, best_ask: float,
@@ -445,10 +503,31 @@ class PairMarketMakerV2:
         inventory: float, inventory_usd: float, unrealized: float,
     ) -> None:
         """QUOTING: Quotes actives. Surveiller le flow et les fills."""
-        # Check si le flow est devenu toxique
-        is_safe, reason = self._flow.is_safe_to_quote()
-        if not is_safe:
-            # Pull toutes les quotes
+        # Classify regime
+        regime, confidence = self._flow.classify_regime()
+
+        if regime in ("trending_up", "trending_down"):
+            # Flow shifted to trending → pull quotes and trend follow
+            if not self.dry_run:
+                try:
+                    await self.client.cancel_coin_orders(self.config.coin)
+                except Exception:
+                    pass
+            self._current_orders = []
+            direction = "long" if regime == "trending_up" else "short"
+            self._state = "TREND_FOLLOWING"
+            self._trend_direction = direction
+            self._trend_entry_time = time.time()
+            self._trend_entry_price = 0.0
+            self._safe_since = 0
+            self._log.info("state_change", new_state="TREND_FOLLOWING",
+                           from_state="QUOTING", direction=direction,
+                           confidence=round(confidence, 2))
+            await self._enter_trend_position(mid, direction)
+            return
+
+        # Check si le flow n'est plus calm (zone grise) → retour monitoring
+        if regime != "calm":
             if not self.dry_run:
                 try:
                     await self.client.cancel_coin_orders(self.config.coin)
@@ -457,7 +536,7 @@ class PairMarketMakerV2:
             self._current_orders = []
             self._state = "MONITORING"
             self._safe_since = 0
-            self._log.info("state_change", new_state="MONITORING", reason=reason)
+            self._log.info("state_change", new_state="MONITORING", reason="flow_uncertain")
             return
 
         # Check si on a été fill (inventaire non-nul)
@@ -466,7 +545,6 @@ class PairMarketMakerV2:
             self._closing_start = time.time()
             self._log.info("state_change", new_state="CLOSING",
                            inventory_usd=round(inventory_usd, 2))
-            # Cancel quotes normales immédiatement, on va placer des close orders
             if not self.dry_run:
                 try:
                     await self.client.cancel_coin_orders(self.config.coin)
@@ -497,8 +575,8 @@ class PairMarketMakerV2:
         unrealized: float,
     ) -> None:
         """CLOSING: Fermer la position en profit si possible."""
-        # STOP LOSS: si perte > $0.30, emergency close
-        if unrealized < -0.30:
+        # STOP LOSS: si perte > seuil, emergency close
+        if unrealized < -self.STOP_LOSS_USD:
             self._state = "EMERGENCY_CLOSE"
             self._log.info("state_change", new_state="EMERGENCY_CLOSE",
                            unrealized=round(unrealized, 4))
@@ -508,6 +586,8 @@ class PairMarketMakerV2:
         if abs(inventory_usd) < 5.0:
             self._state = "MONITORING"
             self._safe_since = 0
+            self._trend_direction = ""
+            self._trend_entry_price = 0.0
             self._log.info("state_change", new_state="MONITORING",
                            reason="position_closed")
             # Cancel any remaining close orders
@@ -525,7 +605,7 @@ class PairMarketMakerV2:
         if unrealized > 0:
             # En profit → close à 2 bps
             close_spread_bps = 2.0
-        elif time_in_closing > 120:
+        elif time_in_closing > self.CLOSING_TIMEOUT_SEC:
             # Timeout → élargir le close pour forcer la sortie
             close_spread_bps = 5.0
         else:
@@ -589,6 +669,8 @@ class PairMarketMakerV2:
             self._state = "MONITORING"
             self._emergency_cooldown_until = time.time() + 60.0
             self._safe_since = 0
+            self._trend_direction = ""
+            self._trend_entry_price = 0.0
             self._log.info("state_change", new_state="MONITORING",
                            reason="emergency_done", cooldown_sec=60)
             return
@@ -624,7 +706,166 @@ class PairMarketMakerV2:
         self._state = "MONITORING"
         self._emergency_cooldown_until = time.time() + 60.0
         self._safe_since = 0
+        self._trend_direction = ""
+        self._trend_entry_price = 0.0
         self._cached_inventory = 0.0
+
+    # =====================================================================
+    # Trend following handlers
+    # =====================================================================
+
+    async def _enter_trend_position(self, mid: float, direction: str) -> None:
+        """Place un limit order agressif pour entrer en position trend."""
+        if self.dry_run:
+            self._trend_entry_price = mid
+            self._log.info("dry_trend_entry", direction=direction, mid=round(mid, 4))
+            return
+
+        coin = self.config.coin
+        sz = self.config.order_size_usd / mid
+
+        # Limit à 2 bps du mid pour fill rapide
+        if direction == "long":
+            price = mid * (1 + 2.0 / 10_000)
+            is_buy = True
+        else:
+            price = mid * (1 - 2.0 / 10_000)
+            is_buy = False
+
+        price = self._round_price(price)
+
+        try:
+            # Cancel any existing orders first
+            await self.client.cancel_coin_orders(coin)
+            self._current_orders = []
+
+            order = {
+                "coin": coin,
+                "is_buy": is_buy,
+                "size": sz,
+                "price": price,
+                "post_only": False,  # GTC, on veut le fill
+            }
+            results = await self.client.place_bulk_orders([order])
+
+            if results and results[0].success:
+                if results[0].status == "filled":
+                    self._trend_entry_price = results[0].avg_px or mid
+                    self._log.info("trend_entry_filled",
+                                   direction=direction,
+                                   price=round(self._trend_entry_price, 4),
+                                   size=round(sz, 6))
+                else:
+                    # Resting → will check fill on next cycles
+                    self._current_orders = [{
+                        "oid": results[0].oid,
+                        "is_buy": is_buy,
+                        "price": price,
+                        "size": sz,
+                    }]
+                    self._log.info("trend_entry_resting",
+                                   direction=direction, price=round(price, 4))
+            else:
+                error = results[0].error if results else "no_result"
+                self._log.warning("trend_entry_failed", error=error)
+                # Failed → back to monitoring
+                self._state = "MONITORING"
+                self._safe_since = 0
+                self._trend_direction = ""
+        except Exception as e:
+            self._log.error("trend_entry_error", error=str(e))
+            self._state = "MONITORING"
+            self._safe_since = 0
+            self._trend_direction = ""
+
+    async def _handle_trend_following(
+        self, mid: float, inventory: float, inventory_usd: float,
+        unrealized: float,
+    ) -> None:
+        """TREND_FOLLOWING: Gérer une position directionnelle."""
+        now = time.time()
+        elapsed = now - self._trend_entry_time
+
+        # 1. Check si l'entry order est fill (entry timeout)
+        if self._trend_entry_price == 0.0:
+            # Pas encore fill → check timeout
+            if elapsed > self.TREND_ENTRY_TIMEOUT_SEC:
+                # Timeout: cancel entry order, retour monitoring
+                if not self.dry_run:
+                    try:
+                        await self.client.cancel_coin_orders(self.config.coin)
+                    except Exception:
+                        pass
+                self._current_orders = []
+                self._state = "MONITORING"
+                self._safe_since = 0
+                self._trend_direction = ""
+                self._log.info("trend_entry_timeout", elapsed=round(elapsed, 1))
+                return
+
+            # Check if we got filled via inventory
+            if abs(inventory_usd) > 5.0:
+                # Use API entry price
+                if self._cached_entry_price > 0:
+                    self._trend_entry_price = self._cached_entry_price
+                else:
+                    self._trend_entry_price = mid
+                self._log.info("trend_entry_detected",
+                               entry_price=round(self._trend_entry_price, 4),
+                               inventory_usd=round(inventory_usd, 2))
+            return
+
+        # 2. Position active → check TP/SL/timeout/reversal
+        entry = self._trend_entry_price
+
+        if entry > 0:
+            if self._trend_direction == "long":
+                move_bps = (mid - entry) / entry * 10_000
+            else:
+                move_bps = (entry - mid) / entry * 10_000
+        else:
+            move_bps = 0.0
+
+        # Take Profit
+        if move_bps >= self.TREND_TAKE_PROFIT_BPS:
+            self._log.info("trend_tp_hit",
+                           direction=self._trend_direction,
+                           move_bps=round(move_bps, 1),
+                           unrealized=round(unrealized, 4))
+            self._state = "CLOSING"
+            self._closing_start = now
+            return
+
+        # Stop Loss
+        if move_bps <= -self.TREND_STOP_LOSS_BPS:
+            self._log.info("trend_sl_hit",
+                           direction=self._trend_direction,
+                           move_bps=round(move_bps, 1),
+                           unrealized=round(unrealized, 4))
+            self._state = "EMERGENCY_CLOSE"
+            return
+
+        # Timeout
+        if elapsed > self.TREND_MAX_DURATION_SEC:
+            self._log.info("trend_timeout",
+                           direction=self._trend_direction,
+                           elapsed=round(elapsed, 0),
+                           move_bps=round(move_bps, 1))
+            self._state = "CLOSING"
+            self._closing_start = now
+            return
+
+        # Flow reversal: si le régime s'est retourné
+        regime, _ = self._flow.classify_regime()
+        if (self._trend_direction == "long" and regime == "trending_down") or \
+           (self._trend_direction == "short" and regime == "trending_up"):
+            self._log.info("trend_reversal",
+                           direction=self._trend_direction,
+                           new_regime=regime,
+                           move_bps=round(move_bps, 1))
+            self._state = "CLOSING"
+            self._closing_start = now
+            return
 
     # =====================================================================
     # Full requote (used in QUOTING state)
@@ -1032,10 +1273,22 @@ class PairMarketMakerV2:
     def _update_state(self, mid: float, best_bid: float, best_ask: float) -> None:
         """Met à jour l'état pour le dashboard."""
         spread_bps = ((best_ask - best_bid) / mid) * 10_000 if mid > 0 else 0
-        inventory = self.pnl.current_inventory
-        unrealized = self.pnl.get_unrealized_pnl(mid)
+        inventory = self._cached_inventory if self._cached_inventory != 0.0 else self.pnl.current_inventory
+
+        # Use API entry price for more accurate unrealized PnL
+        if self._cached_entry_price > 0 and abs(inventory) > 1e-12:
+            unrealized = inventory * (mid - self._cached_entry_price)
+        else:
+            unrealized = self.pnl.get_unrealized_pnl(mid)
+
         realized = self.pnl.state.realized_pnl
-        total = self.pnl.get_total_pnl(mid)
+        total = realized + unrealized
+
+        # Build state label with flow info
+        flow_imb = self._flow.get_flow_imbalance()
+        state_label = self._state
+        if self._state == "TREND_FOLLOWING" and self._trend_direction:
+            state_label = f"TREND_{self._trend_direction.upper()}"
 
         self.state.mid_price = mid
         self.state.best_bid = best_bid
@@ -1048,7 +1301,8 @@ class PairMarketMakerV2:
         self.state.total_pnl = round(total, 4)
         self.state.fills_count = self.pnl.fills_count
         self.state.last_update = time.time()
-        self.state.quoting_mode = self._state
+        self.state.quoting_mode = state_label
+        self.state.trend_signal = round(flow_imb * 100, 1)  # Flow imbalance as %
 
     async def _log_snapshot(
         self, mid: float, best_bid: float, best_ask: float,
@@ -1069,6 +1323,29 @@ class PairMarketMakerV2:
     # =====================================================================
     # Helpers
     # =====================================================================
+
+    async def _update_flow(self) -> None:
+        """Fetch recent market trades and feed to FlowAnalyzer.
+
+        Deduplicates by (tid, time) hash to avoid counting the same trade twice.
+        """
+        try:
+            market_trades = await self.client.get_recent_market_trades(
+                self.config.coin, 50
+            )
+            for t in market_trades:
+                trade_id = (t.get("tid", ""), t.get("time", ""))
+                if trade_id not in self._seen_market_trades:
+                    self._seen_market_trades.add(trade_id)
+                    side = "buy" if t.get("side") == "B" else "sell"
+                    size_usd = float(t.get("px", 0)) * float(t.get("sz", 0))
+                    self._flow.record_trade(side, size_usd)
+        except Exception:
+            pass
+
+        # Trim seen trades set to prevent unbounded growth
+        if len(self._seen_market_trades) > 500:
+            self._seen_market_trades = set(list(self._seen_market_trades)[-200:])
 
     @staticmethod
     def _round_price(price: float) -> float:
