@@ -24,3 +24,6 @@ numpy>=1.26.0
 pyarrow>=14.0.0
 matplotlib>=3.8.0
 tqdm>=4.66.0
+
+# AI Monitoring
+anthropic>=0.39.0
