@@ -162,10 +162,9 @@ class PairMarketMakerV2:
     """
     
     # --- Paramètres AS ---
-    GAMMA = 0.3                     # Risk aversion (plus haut = spread plus large)
-    KAPPA = 1.5                     # Intensité du carnet (fill rate parameter)
-    MIN_SPREAD_BPS = 5.0            # Spread plancher (jamais en-dessous)
-    MAX_SPREAD_BPS = 50.0           # Spread plafond
+    GAMMA = 0.5                     # Facteur de sensibilité à la volatilité (vol adjustment)
+    MIN_SPREAD_BPS = 8.0            # Spread plancher (jamais en-dessous)
+    MAX_SPREAD_BPS = 30.0           # Spread plafond
     
     # --- Paramètres event-driven ---
     POLL_INTERVAL_SEC = 5.0         # Fréquence de lecture du prix
@@ -311,16 +310,15 @@ class PairMarketMakerV2:
         inventory_usd = inventory * mid
         
         # --- Signaux micro-structure ---
-        sigma = self._vol.get_sigma()  # en unités de prix/sqrt(sec)
         sigma_bps = self._vol.get_sigma_bps()
         imbalance = self._book.get_imbalance(bid_depth, ask_depth)
         trend_bps = self._get_trend_bps()
-        
+
         # --- Calcul du spread optimal (Avellaneda-Stoikov) ---
-        spread_bps = self._compute_as_spread(sigma, mid)
-        
+        spread_bps = self._compute_as_spread()
+
         # --- Reservation price (mid ajusté par inventaire) ---
-        reservation_mid = self._compute_reservation_price(mid, inventory, sigma)
+        reservation_mid = self._compute_reservation_price(mid, inventory)
         
         # --- Application de l'imbalance ---
         # Si imbalance positif (plus de bids), le prix va monter
@@ -436,73 +434,59 @@ class PairMarketMakerV2:
     # Avellaneda-Stoikov spread computation
     # =====================================================================
     
-    def _compute_as_spread(self, sigma: float, mid: float) -> float:
+    def _compute_as_spread(self) -> float:
         """Calcule le spread optimal AS en bps.
-        
-        Formule simplifiée d'Avellaneda-Stoikov:
-            spread = gamma * sigma^2 + (2/gamma) * ln(1 + gamma/kappa)
-        
-        gamma = risk aversion
-        sigma = volatilité (en unités de prix)
-        kappa = intensité de remplissage (queue depth parameter)
-        
-        Le résultat est en unités de prix, converti en bps.
+
+        Formule simplifiée en espace bps:
+            spread = base_spread + gamma * sigma_bps²
+
+        Plus la volatilité est haute, plus on élargit le spread.
+        Travaille directement en bps pour éviter les problèmes de calibration.
         """
-        gamma = self.GAMMA
-        kappa = self.KAPPA
-        
-        if sigma <= 0 or mid <= 0:
-            # Fallback au spread configuré si pas assez de données
+        sigma_bps = self._vol.get_sigma_bps()
+
+        if sigma_bps < 0.5:
+            # Pas assez de données → fallback au spread configuré
             return self.config.spread_bps
-        
-        # Composante volatilité: spread augmente avec sigma²
-        vol_component = gamma * sigma * sigma
-        
-        # Composante profondeur: spread augmente quand kappa est petit (book mince)
-        depth_component = (2.0 / gamma) * math.log(1.0 + gamma / kappa)
-        
-        spread_price = vol_component + depth_component
-        spread_bps = (spread_price / mid) * 10_000
-        
-        # Clamp
-        spread_bps = max(self.MIN_SPREAD_BPS, min(self.MAX_SPREAD_BPS, spread_bps))
-        
-        return spread_bps
+
+        # Formule AS en bps: spread = base + gamma * sigma_bps²
+        # Plus la vol est haute, plus on élargit
+        base_spread = self.config.spread_bps  # 15 bps comme plancher
+        vol_adjustment = self.GAMMA * sigma_bps * sigma_bps
+
+        spread = base_spread + vol_adjustment
+        return max(self.MIN_SPREAD_BPS, min(self.MAX_SPREAD_BPS, spread))
     
     def _compute_reservation_price(
-        self, mid: float, inventory: float, sigma: float,
+        self, mid: float, inventory: float,
     ) -> float:
         """Calcule le reservation price (mid ajusté par l'inventaire).
-        
-        Formule AS: r = mid - q * gamma * sigma^2
-        
+
+        Formule AS en bps: skew = q * gamma * sigma_bps²
+
         q > 0 (long) → r < mid → on veut vendre → bids plus loin, asks plus près
         q < 0 (short) → r > mid → on veut acheter → asks plus loin, bids plus près
         """
-        gamma = self.GAMMA
         max_inv = self.config.max_inventory_usd
-        
+
         if max_inv <= 0 or mid <= 0:
             return mid
-        
+
         # Normaliser q entre -1 et 1
         q_normalized = (inventory * mid) / max_inv
         q_normalized = max(-1.0, min(1.0, q_normalized))
-        
-        if sigma <= 0:
+
+        sigma_bps = self._vol.get_sigma_bps()
+
+        if sigma_bps < 0.5:
             # Fallback: skew linéaire classique
-            skew = q_normalized * self.config.spread_bps / 10_000
-            return mid * (1 - skew * self.config.inventory_skew_factor)
-        
-        # AS reservation price adjustment
-        reservation_shift = q_normalized * gamma * sigma * sigma
-        reservation_mid = mid - reservation_shift
-        
-        # Sanity check: ne pas décaler de plus de 50 bps
-        max_shift = mid * 50.0 / 10_000
-        reservation_mid = max(mid - max_shift, min(mid + max_shift, reservation_mid))
-        
-        return reservation_mid
+            skew_bps = q_normalized * self.config.spread_bps * self.config.inventory_skew_factor
+        else:
+            # AS reservation: shift proportionnel à q * vol
+            skew_bps = q_normalized * self.GAMMA * sigma_bps * sigma_bps
+            skew_bps = max(-20.0, min(20.0, skew_bps))  # cap à 20 bps
+
+        return mid * (1 - skew_bps / 10_000)
     
     # =====================================================================
     # Order building
@@ -657,16 +641,16 @@ class PairMarketMakerV2:
         """Récupère l'inventaire depuis l'API."""
         if self.dry_run:
             return self.pnl.current_inventory
-        
+
         try:
             account = await self.client.get_account_state()
             for pos in account.positions:
                 if pos.coin == self.config.coin:
                     return pos.size
+            return 0.0  # Pas de position trouvée = inventory 0
         except Exception as e:
             self._log.warning("inventory_fetch_error", error=str(e))
-        
-        return self.pnl.current_inventory
+            return self.pnl.current_inventory  # Fallback uniquement si API fail
     
     async def _check_fills(self, mid_price: float) -> None:
         """Poll les fills récents."""
