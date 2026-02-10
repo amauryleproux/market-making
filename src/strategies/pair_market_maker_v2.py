@@ -357,6 +357,12 @@ class PairMarketMakerV2:
         self._trend_direction: str = ""      # "long" ou "short"
         self._trend_entry_time: float = 0.0
 
+        # Pyramiding state
+        self._trend_add_count: int = 0           # Nombre d'ajouts
+        self._trend_max_adds: int = 3            # Max 3 ajouts après l'entrée initiale
+        self._trend_last_add_time: float = 0.0
+        self._trend_trailing_stop: float = 0.0   # Prix du trailing stop
+
     # =====================================================================
     # Main loop — event-driven
     # =====================================================================
@@ -481,6 +487,9 @@ class PairMarketMakerV2:
             self._trend_direction = direction
             self._trend_entry_time = time.time()
             self._trend_entry_price = 0.0  # Will be set on fill
+            self._trend_add_count = 0
+            self._trend_trailing_stop = 0.0
+            self._trend_last_add_time = 0.0
             self._log.info("state_change", new_state="TREND_FOLLOWING",
                            direction=direction, confidence=round(confidence, 2),
                            imbalance=round(self._flow.get_flow_imbalance(), 2))
@@ -519,6 +528,9 @@ class PairMarketMakerV2:
             self._trend_direction = direction
             self._trend_entry_time = time.time()
             self._trend_entry_price = 0.0
+            self._trend_add_count = 0
+            self._trend_trailing_stop = 0.0
+            self._trend_last_add_time = 0.0
             self._safe_since = 0
             self._log.info("state_change", new_state="TREND_FOLLOWING",
                            from_state="QUOTING", direction=direction,
@@ -588,6 +600,9 @@ class PairMarketMakerV2:
             self._safe_since = 0
             self._trend_direction = ""
             self._trend_entry_price = 0.0
+            self._trend_add_count = 0
+            self._trend_trailing_stop = 0.0
+            self._trend_last_add_time = 0.0
             self._log.info("state_change", new_state="MONITORING",
                            reason="position_closed")
             # Cancel any remaining close orders
@@ -671,6 +686,9 @@ class PairMarketMakerV2:
             self._safe_since = 0
             self._trend_direction = ""
             self._trend_entry_price = 0.0
+            self._trend_add_count = 0
+            self._trend_trailing_stop = 0.0
+            self._trend_last_add_time = 0.0
             self._log.info("state_change", new_state="MONITORING",
                            reason="emergency_done", cooldown_sec=60)
             return
@@ -708,6 +726,9 @@ class PairMarketMakerV2:
         self._safe_since = 0
         self._trend_direction = ""
         self._trend_entry_price = 0.0
+        self._trend_add_count = 0
+        self._trend_trailing_stop = 0.0
+        self._trend_last_add_time = 0.0
         self._cached_inventory = 0.0
 
     # =====================================================================
@@ -782,9 +803,10 @@ class PairMarketMakerV2:
         self, mid: float, inventory: float, inventory_usd: float,
         unrealized: float,
     ) -> None:
-        """TREND_FOLLOWING: Gérer une position directionnelle."""
+        """TREND_FOLLOWING: Gérer une position directionnelle avec pyramiding."""
         now = time.time()
         elapsed = now - self._trend_entry_time
+        cfg = self.config
 
         # 1. Check si l'entry order est fill (entry timeout)
         if self._trend_entry_price == 0.0:
@@ -793,13 +815,16 @@ class PairMarketMakerV2:
                 # Timeout: cancel entry order, retour monitoring
                 if not self.dry_run:
                     try:
-                        await self.client.cancel_coin_orders(self.config.coin)
+                        await self.client.cancel_coin_orders(cfg.coin)
                     except Exception:
                         pass
                 self._current_orders = []
                 self._state = "MONITORING"
                 self._safe_since = 0
                 self._trend_direction = ""
+                self._trend_add_count = 0
+                self._trend_trailing_stop = 0.0
+                self._trend_last_add_time = 0.0
                 self._log.info("trend_entry_timeout", elapsed=round(elapsed, 1))
                 return
 
@@ -815,7 +840,7 @@ class PairMarketMakerV2:
                                inventory_usd=round(inventory_usd, 2))
             return
 
-        # 2. Position active → check TP/SL/timeout/reversal
+        # 2. Position active → compute PnL in bps
         entry = self._trend_entry_price
 
         if entry > 0:
@@ -826,46 +851,127 @@ class PairMarketMakerV2:
         else:
             move_bps = 0.0
 
-        # Take Profit
+        # 3. Trailing stop check (plus serré que le stop-loss fixe)
+        if self._trend_trailing_stop > 0 and abs(inventory_usd) > 5.0:
+            triggered = False
+            if self._trend_direction == "long" and mid < self._trend_trailing_stop:
+                triggered = True
+            elif self._trend_direction == "short" and mid > self._trend_trailing_stop:
+                triggered = True
+
+            if triggered:
+                self._log.info("trailing_stop_triggered", coin=cfg.coin,
+                               mid=round(mid, 4),
+                               trailing_stop=round(self._trend_trailing_stop, 4),
+                               move_bps=round(move_bps, 1),
+                               adds=self._trend_add_count)
+                self._state = "CLOSING"  # Pas EMERGENCY, on est probablement en profit
+                self._closing_start = now
+                return
+
+        # 4. Take Profit
         if move_bps >= self.TREND_TAKE_PROFIT_BPS:
             self._log.info("trend_tp_hit",
                            direction=self._trend_direction,
                            move_bps=round(move_bps, 1),
-                           unrealized=round(unrealized, 4))
+                           unrealized=round(unrealized, 4),
+                           adds=self._trend_add_count)
             self._state = "CLOSING"
             self._closing_start = now
             return
 
-        # Stop Loss
+        # 5. Stop Loss
         if move_bps <= -self.TREND_STOP_LOSS_BPS:
             self._log.info("trend_sl_hit",
                            direction=self._trend_direction,
                            move_bps=round(move_bps, 1),
-                           unrealized=round(unrealized, 4))
+                           unrealized=round(unrealized, 4),
+                           adds=self._trend_add_count)
             self._state = "EMERGENCY_CLOSE"
             return
 
-        # Timeout
+        # 6. Timeout
         if elapsed > self.TREND_MAX_DURATION_SEC:
             self._log.info("trend_timeout",
                            direction=self._trend_direction,
                            elapsed=round(elapsed, 0),
-                           move_bps=round(move_bps, 1))
+                           move_bps=round(move_bps, 1),
+                           adds=self._trend_add_count)
             self._state = "CLOSING"
             self._closing_start = now
             return
 
-        # Flow reversal: si le régime s'est retourné
-        regime, _ = self._flow.classify_regime()
+        # 7. Flow reversal: si le régime s'est retourné
+        regime, confidence = self._flow.classify_regime()
         if (self._trend_direction == "long" and regime == "trending_down") or \
            (self._trend_direction == "short" and regime == "trending_up"):
             self._log.info("trend_reversal",
                            direction=self._trend_direction,
                            new_regime=regime,
-                           move_bps=round(move_bps, 1))
+                           move_bps=round(move_bps, 1),
+                           adds=self._trend_add_count)
             self._state = "CLOSING"
             self._closing_start = now
             return
+
+        # 8. Pyramiding: ajouter à la position si le trend continue
+        if self.dry_run:
+            return
+
+        can_add = (
+            self._trend_add_count < self._trend_max_adds
+            and now - self._trend_last_add_time > 10.0  # Min 10s entre ajouts
+            and abs(inventory_usd) > 5.0  # On a déjà une position initiale
+            and move_bps > 5.0  # Position actuelle en profit d'au moins 5 bps
+        )
+
+        if can_add:
+            flow_confirms = (
+                (self._trend_direction == "long" and regime == "trending_up" and confidence > 0.6)
+                or (self._trend_direction == "short" and regime == "trending_down" and confidence > 0.6)
+            )
+
+            if flow_confirms:
+                # Taille décroissante: 100%, 70%, 50% de la taille de base
+                size_mult = [1.0, 0.7, 0.5][self._trend_add_count]
+                add_size = (cfg.order_size_usd * size_mult) / mid
+
+                # Placer un limit maker pour le rebate
+                if self._trend_direction == "long":
+                    add_price = mid * (1 - 2.0 / 10_000)
+                else:
+                    add_price = mid * (1 + 2.0 / 10_000)
+                add_price = self._round_price(add_price)
+
+                add_order = {
+                    "coin": cfg.coin,
+                    "is_buy": self._trend_direction == "long",
+                    "size": add_size,
+                    "price": add_price,
+                    "post_only": True,
+                    "level": 0,
+                }
+
+                try:
+                    results = await self.client.place_bulk_orders([add_order])
+                    if results and results[0].success:
+                        self._trend_add_count += 1
+                        self._trend_last_add_time = now
+
+                        # Trailing stop: remonter au entry du dernier ajout - 5 bps
+                        if self._trend_direction == "long":
+                            self._trend_trailing_stop = add_price * (1 - 5.0 / 10_000)
+                        else:
+                            self._trend_trailing_stop = add_price * (1 + 5.0 / 10_000)
+
+                        self._log.info("trend_pyramid_add", coin=cfg.coin,
+                                       add_number=self._trend_add_count,
+                                       price=round(add_price, 4),
+                                       size=round(add_size, 4),
+                                       trailing_stop=round(self._trend_trailing_stop, 4),
+                                       move_bps=round(move_bps, 1))
+                except Exception as e:
+                    self._log.warning("trend_pyramid_error", error=str(e))
 
     # =====================================================================
     # Full requote (used in QUOTING state)
