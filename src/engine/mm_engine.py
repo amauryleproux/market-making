@@ -17,6 +17,7 @@ from typing import Optional
 from src.client.hyperliquid import HyperliquidClient
 from src.client.async_wrapper import AsyncHyperliquidClient
 from src.strategies.pair_market_maker import PairMarketMaker, PairConfig, PairState
+from src.strategies.pair_market_maker_v2 import PairMarketMakerV2
 from src.monitoring.db_logger import DBLogger
 from src.monitoring.pnl_tracker import PairPnLTracker
 from src.monitoring.dashboard import Dashboard
@@ -34,6 +35,7 @@ class GlobalConfig:
     dashboard_refresh_sec: float = 10
     snapshot_interval_sec: float = 60
     db_path: str = "data/trading_log.db"
+    strategy_version: str = "v2"  # "v1" ou "v2"
 
 
 class MMEngine:
@@ -94,6 +96,7 @@ class MMEngine:
             dashboard_refresh_sec=g.get("dashboard_refresh_sec", 10),
             snapshot_interval_sec=g.get("snapshot_interval_sec", 60),
             db_path=g.get("db_path", "data/trading_log.db"),
+            strategy_version=g.get("strategy_version", "v2"),
         )
 
         # Pair configs
@@ -153,7 +156,11 @@ class MMEngine:
             tracker = PairPnLTracker(coin)
             self._pnl_trackers[coin] = tracker
 
-            maker = PairMarketMaker(
+            # Choisir la stratégie selon la config
+            use_v2 = self._global_config.strategy_version == "v2"
+            MakerClass = PairMarketMakerV2 if use_v2 else PairMarketMaker
+
+            maker = MakerClass(
                 config=pc,
                 client=self._client,
                 db=self._db,
@@ -165,7 +172,8 @@ class MMEngine:
 
         log.info("engine_ready",
                  pairs=valid_coins,
-                 dry_run=self._dry_run)
+                 dry_run=self._dry_run,
+                 strategy=self._global_config.strategy_version)
 
         # Setup signal handlers
         self._setup_signal_handlers()
