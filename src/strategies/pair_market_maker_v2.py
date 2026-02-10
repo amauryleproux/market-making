@@ -13,6 +13,7 @@ Changements majeurs vs V1:
 - Funding rate bias: collecte le funding en biaisant la position
 - Asymmetric sizing: accélère le retour à flat
 - Aggressive profit-taking: tight close orders when unrealized PnL is high
+- Stop-loss per position: market close + 60s cooldown if loss > $0.30
 """
 
 import asyncio
@@ -233,6 +234,9 @@ class PairMarketMakerV2:
         self._cached_funding: float = 0.0
         self._funding_fetch_time: float = 0.0
 
+        # Stop-loss cooldown (Fix 9)
+        self._stop_loss_cooldown_until: float = 0.0
+
     # =====================================================================
     # Main loop — event-driven
     # =====================================================================
@@ -281,6 +285,19 @@ class PairMarketMakerV2:
         # 2. Enregistrer le prix
         self._vol.record(mid)
         self._price_history.append((time.time(), mid))
+
+        # 2b. Stop-loss cooldown (Fix 9): skip everything except price polling
+        now = time.time()
+        if now < self._stop_loss_cooldown_until:
+            self._update_state(mid, best_bid, best_ask)
+            return
+
+        # 2c. Stop-loss check (Fix 9): close position if loss > $0.30
+        if not self.dry_run and abs(self._cached_inventory) > 1e-12:
+            unrealized = self.pnl.get_unrealized_pnl(mid)
+            if unrealized < -0.30:
+                await self._execute_stop_loss(mid, self._cached_inventory, unrealized)
+                return
 
         # 3. Check fills (seulement tous les 3 cycles pour économiser les appels)
         if not self.dry_run and self._cycle_count % 3 == 0:
@@ -836,6 +853,58 @@ class PairMarketMakerV2:
             # Post-fill cooldown: laisser le prix se stabiliser avant de requoter
             self._fill_cooldown_until = time.time() + 4.0
             self._last_quote_time = 0  # Force requote après le cooldown
+
+    async def _execute_stop_loss(
+        self, mid: float, inventory: float, unrealized: float,
+    ) -> None:
+        """Fix 9: Stop-loss — ferme la position en market si perte > $0.30.
+
+        Cancel tous les ordres, market close, puis cooldown 60s.
+        """
+        coin = self.config.coin
+        self._log.warning(
+            "stop_loss_triggered",
+            coin=coin,
+            inventory=round(inventory, 6),
+            unrealized=round(unrealized, 4),
+            mid=round(mid, 4),
+        )
+
+        try:
+            # 1. Cancel tous les ordres
+            await self.client.cancel_coin_orders(coin)
+            self._current_orders = []
+            self._pending_tp_order = None
+            self._pending_tp_time = 0
+
+            # 2. Market order reduce_only pour fermer
+            is_buy = inventory < 0  # short → buy to close, long → sell to close
+            size = abs(inventory)
+
+            result = await self.client.market_order(
+                coin=coin,
+                is_buy=is_buy,
+                size=size,
+                reduce_only=True,
+            )
+
+            if result.success:
+                self._log.info(
+                    "stop_loss_closed",
+                    coin=coin,
+                    side="buy" if is_buy else "sell",
+                    size=round(size, 6),
+                )
+            else:
+                self._log.error("stop_loss_close_failed", error=result.error)
+
+        except Exception as e:
+            self._log.error("stop_loss_error", error=str(e))
+
+        # 3. Cooldown 60s — ne placer aucun ordre
+        self._stop_loss_cooldown_until = time.time() + 60.0
+        self._last_quote_time = 0  # Force requote after cooldown
+        self._cached_inventory = 0.0  # Reset cached inventory
 
     async def _check_take_profit(self, mid_price: float, inventory: float) -> bool:
         """Vérifie si on doit prendre le profit. Utilise un limit order post_only
