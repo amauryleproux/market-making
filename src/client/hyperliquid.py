@@ -372,7 +372,10 @@ class HyperliquidClient:
             return [OrderResult(success=False, error=str(e))]
 
     def cancel_all(self, coin: Optional[str] = None) -> bool:
-        """Annule tous les ordres (ou ceux d'un coin spécifique)."""
+        """Annule tous les ordres (ou ceux d'un coin spécifique).
+        
+        Uses bulk cancel for speed — critical for anti-flip.
+        """
         if self._exchange is None:
             return False
 
@@ -381,18 +384,41 @@ class HyperliquidClient:
             if not orders:
                 return True
 
-            cancels = []
+            # Use bulk cancel via cancel_by_cloid or batch cancel
+            # Group by coin for the API
+            by_coin: dict[str, list[int]] = {}
             for o in orders:
-                cancels.append({"coin": o["coin"], "oid": o["oid"]})
+                c = o["coin"]
+                if c not in by_coin:
+                    by_coin[c] = []
+                by_coin[c].append(o["oid"])
 
-            if cancels:
-                self._exchange.cancel(cancels[0]["coin"], cancels[0]["oid"])
-                # Pour plusieurs: utiliser bulk cancel
-                for c in cancels[1:]:
+            for cancel_coin, oids in by_coin.items():
+                if len(oids) == 1:
+                    self._exchange.cancel(cancel_coin, oids[0])
+                else:
+                    # Bulk cancel: send all cancels for this coin at once
+                    # The SDK's bulk_cancel expects list of {"coin": str, "oid": int}
                     try:
-                        self._exchange.cancel(c["coin"], c["oid"])
-                    except Exception:
-                        pass
+                        cancel_requests = [{"coin": cancel_coin, "oid": oid} for oid in oids]
+                        self._exchange.bulk_cancel(cancel_requests)
+                    except AttributeError:
+                        # Fallback if SDK doesn't have bulk_cancel
+                        # Use cancel with list of oids (some SDK versions support this)
+                        try:
+                            self._exchange.cancel(cancel_coin, oids[0])
+                            for oid in oids[1:]:
+                                self._exchange.cancel(cancel_coin, oid)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        # Last resort: cancel one by one
+                        log.warning("bulk_cancel_fallback", coin=cancel_coin, error=str(e))
+                        for oid in oids:
+                            try:
+                                self._exchange.cancel(cancel_coin, oid)
+                            except Exception:
+                                pass
 
             return True
         except Exception as e:

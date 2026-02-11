@@ -270,7 +270,7 @@ class PairMarketMakerV2:
     MAX_SPREAD_BPS = 30.0           # Spread plafond
 
     # --- Paramètres event-driven ---
-    POLL_INTERVAL_SEC = 5.0         # Fréquence de lecture du prix
+    POLL_INTERVAL_SEC = 2.0         # Fréquence de lecture du prix (was 5.0 — too slow for anti-flip)
     REQUOTE_THRESHOLD_BPS = 4.0     # Seuil de mouvement pour requoter
     FORCE_REQUOTE_SEC = 60.0        # Requote forcé après X secondes même sans mouvement
 
@@ -366,6 +366,13 @@ class PairMarketMakerV2:
         # Anti-churn: cooldown after trend exit
         self._last_trend_exit: float = 0.0
 
+        # === ANTI-FLIP FIX ===
+        self._fill_detected_this_cycle: bool = False   # Cancel-on-fill flag
+        self._flip_count_1h: list[float] = []           # Timestamps of flips
+        self._last_position_sign: int = 0               # For flip detection
+        self._max_flips_per_hour: int = 5               # Circuit breaker threshold
+        self._flip_blocked_until: float = 0.0           # Blocked timestamp
+
     # =====================================================================
     # Main loop — event-driven
     # =====================================================================
@@ -420,19 +427,67 @@ class PairMarketMakerV2:
         if self._cycle_count % 2 == 0:
             await self._update_flow()
 
-        # 4. Check fills (tous les 3 cycles)
-        if not self.dry_run and self._cycle_count % 3 == 0:
+        # 4. Check fills — EVERY cycle (was every 3 — too slow, caused flips)
+        old_inv = self._cached_inventory
+        if not self.dry_run:
             await self._check_fills(mid)
 
-        # 5. Refresh inventory — BUG 3 FIX: every cycle when in position
-        in_position_state = self._state in ("TREND_FOLLOWING", "CLOSING", "EMERGENCY_CLOSE")
-        if not self.dry_run and (in_position_state or self._cycle_count % 3 == 0):
+        # 5. Refresh inventory — EVERY CYCLE for cancel-on-fill detection
+        if not self.dry_run:
             inventory = await self._get_inventory()
             self._cached_inventory = inventory
             self._inventory_last_refresh = time.time()
 
         inventory = self._cached_inventory
         inventory_usd = inventory * mid
+
+        # === ANTI-FLIP FIX: Cancel-on-fill ===
+        # If inventory changed since last cycle, a fill happened.
+        # Cancel ALL orders immediately to prevent the opposite side from filling.
+        if not self.dry_run and abs(inventory - old_inv) > 1e-8:
+            self._fill_detected_this_cycle = True
+            try:
+                await self.client.cancel_coin_orders(self.config.coin)
+                self._current_orders = []
+                self._log.info("cancel_on_fill",
+                               old_inv=round(old_inv, 6),
+                               new_inv=round(inventory, 6),
+                               state=self._state)
+            except Exception as e:
+                self._log.warning("cancel_on_fill_error", error=str(e))
+
+            # Flip detection: did position change sign?
+            new_sign = 0 if abs(inventory) < 1e-8 else (1 if inventory > 0 else -1)
+            if (self._last_position_sign != 0 and new_sign != 0
+                    and self._last_position_sign != new_sign):
+                now = time.time()
+                self._flip_count_1h.append(now)
+                # Clean old flips
+                self._flip_count_1h = [t for t in self._flip_count_1h if t > now - 3600]
+                self._log.warning("FLIP_DETECTED",
+                                  flips_1h=len(self._flip_count_1h),
+                                  old_sign=self._last_position_sign,
+                                  new_sign=new_sign)
+                if len(self._flip_count_1h) >= self._max_flips_per_hour:
+                    self._flip_blocked_until = now + 120.0
+                    self._log.error("FLIP_CIRCUIT_BREAKER",
+                                    flips=len(self._flip_count_1h),
+                                    blocked_for_sec=120)
+            self._last_position_sign = new_sign
+        else:
+            self._fill_detected_this_cycle = False
+            # Still track position sign
+            new_sign = 0 if abs(inventory) < 1e-8 else (1 if inventory > 0 else -1)
+            if new_sign != 0:
+                self._last_position_sign = new_sign
+
+        # === ANTI-FLIP: Circuit breaker check ===
+        if time.time() < self._flip_blocked_until:
+            if self._state == "QUOTING":
+                self._state = "MONITORING"
+                self._safe_since = 0
+                self._log.warning("flip_breaker_active", state="MONITORING")
+            return  # Skip this cycle entirely
 
         # 6. BUG 3 FIX: Use API entry price for unrealized PnL when available
         if self._cached_entry_price > 0 and abs(inventory) > 1e-12:
@@ -588,6 +643,12 @@ class PairMarketMakerV2:
             return
 
         # Requote normal si nécessaire
+        # === ANTI-FLIP: Skip requoting if fill was just detected ===
+        # Cancel-on-fill already cleared all orders; wait one cycle before requoting
+        if self._fill_detected_this_cycle:
+            self._log.info("skip_requote_after_fill", state="QUOTING")
+            return
+
         now = time.time()
         mid_moved_bps = 0.0
         if self._last_quoted_mid > 0:
@@ -1211,7 +1272,13 @@ class PairMarketMakerV2:
         quoting_mode: str,
         mid: float,
     ) -> list[dict]:
-        """Construit les ordres de quoting."""
+        """Construit les ordres de quoting.
+        
+        === ANTI-FLIP LOGIC ===
+        Rule 1: Total reduce-side size across ALL levels <= |inventory|
+        Rule 2: When position exists, open-side total <= remaining capacity
+        Rule 3: reduce_only flag on close-side orders when inventory > threshold
+        """
         cfg = self.config
         max_inv = cfg.max_inventory_usd
         half_spread = spread_bps / 2.0 / 10_000
@@ -1242,17 +1309,37 @@ class PairMarketMakerV2:
         orders = []
         sz_per_order = cfg.order_size_usd / mid
 
-        # Asymmetric sizing: accelerate return to flat
-        open_sz = sz_per_order
-        close_sz = sz_per_order
-        if abs(inventory_usd) > 20.0:
-            close_sz = sz_per_order * 1.5
-            open_sz = sz_per_order * 0.7
-
-        # Anti-flip: cap reduce-side size to never flip position
-        if abs(inventory_usd) >= 5.0 and abs(inventory) > 1e-12:
-            max_reduce = abs(inventory) / max(1, cfg.num_levels)
-            close_sz = min(close_sz, max_reduce)
+        # === ANTI-FLIP: Determine which side is open vs close ===
+        has_position = abs(inventory_usd) >= 5.0 and abs(inventory) > 1e-12
+        
+        if has_position:
+            # We have a position — be very careful about the reduce side
+            if inventory > 0:
+                # Long position: sells are reduce (close), buys are open
+                reduce_side_is_sell = True
+            else:
+                # Short position: buys are reduce (close), sells are open
+                reduce_side_is_sell = False
+            
+            # RULE 1: Total reduce-side size = min(|inventory|, normal_total)
+            # This ensures we NEVER flip through the reduce side
+            total_reduce_available = abs(inventory)
+            
+            # Asymmetric sizing: accelerate close, slow down open
+            open_sz = sz_per_order * 0.7   # Smaller on open side
+            # Distribute reduce across levels but cap total
+            reduce_per_level = min(sz_per_order * 1.5, total_reduce_available / max(1, cfg.num_levels))
+            
+            # RULE 2: Track remaining reduce capacity
+            remaining_reduce = total_reduce_available
+            remaining_open_capacity = max_inv - abs(inventory_usd)
+        else:
+            # No position — quote both sides normally
+            open_sz = sz_per_order
+            reduce_per_level = sz_per_order
+            remaining_reduce = float('inf')
+            remaining_open_capacity = max_inv
+            reduce_side_is_sell = None  # doesn't matter
 
         cumulative_buy_usd = 0.0
         cumulative_sell_usd = 0.0
@@ -1260,35 +1347,82 @@ class PairMarketMakerV2:
         for i in range(cfg.num_levels):
             level_offset = i * cfg.level_spacing_bps / 10_000
 
+            # === BID (buy) ===
             if allow_bids:
-                cumulative_buy_usd += cfg.order_size_usd
-                if abs(inventory_usd + cumulative_buy_usd) < max_inv:
-                    bid_price = reservation_mid * (1 - half_spread * bid_mult - level_offset)
-                    bid_price = self._round_price(bid_price)
-                    bid_sz = close_sz if inventory < 0 else open_sz
-                    orders.append({
+                bid_price = reservation_mid * (1 - half_spread * bid_mult - level_offset)
+                bid_price = self._round_price(bid_price)
+                
+                if has_position and not reduce_side_is_sell:
+                    # Buys are REDUCE side (we're short)
+                    bid_sz = min(reduce_per_level, remaining_reduce)
+                    if bid_sz < 1e-8:
+                        bid_sz = 0  # No more reduce capacity
+                    else:
+                        remaining_reduce -= bid_sz
+                    use_reduce_only = True
+                else:
+                    # Buys are OPEN side (we're long or flat)
+                    bid_sz = open_sz
+                    cumulative_buy_usd += bid_sz * mid
+                    # Check capacity
+                    if has_position and cumulative_buy_usd > remaining_open_capacity:
+                        bid_sz = 0  # Would exceed max inventory
+                    elif not has_position:
+                        cumulative_buy_usd_check = cumulative_buy_usd
+                        if abs(inventory_usd + cumulative_buy_usd_check) >= max_inv:
+                            bid_sz = 0
+                    use_reduce_only = False
+                
+                if bid_sz > 1e-8:
+                    order = {
                         "coin": cfg.coin,
                         "is_buy": True,
                         "size": bid_sz,
                         "price": bid_price,
                         "post_only": True,
                         "level": i,
-                    })
+                    }
+                    if use_reduce_only and has_position:
+                        order["reduce_only"] = True
+                    orders.append(order)
 
+            # === ASK (sell) ===
             if allow_asks:
-                cumulative_sell_usd += cfg.order_size_usd
-                if abs(inventory_usd - cumulative_sell_usd) < max_inv:
-                    ask_price = reservation_mid * (1 + half_spread * ask_mult + level_offset)
-                    ask_price = self._round_price(ask_price)
-                    ask_sz = close_sz if inventory > 0 else open_sz
-                    orders.append({
+                ask_price = reservation_mid * (1 + half_spread * ask_mult + level_offset)
+                ask_price = self._round_price(ask_price)
+                
+                if has_position and reduce_side_is_sell:
+                    # Sells are REDUCE side (we're long)
+                    ask_sz = min(reduce_per_level, remaining_reduce)
+                    if ask_sz < 1e-8:
+                        ask_sz = 0
+                    else:
+                        remaining_reduce -= ask_sz
+                    use_reduce_only = True
+                else:
+                    # Sells are OPEN side (we're short or flat)
+                    ask_sz = open_sz
+                    cumulative_sell_usd += ask_sz * mid
+                    if has_position and cumulative_sell_usd > remaining_open_capacity:
+                        ask_sz = 0
+                    elif not has_position:
+                        cumulative_sell_usd_check = cumulative_sell_usd
+                        if abs(inventory_usd - cumulative_sell_usd_check) >= max_inv:
+                            ask_sz = 0
+                    use_reduce_only = False
+                
+                if ask_sz > 1e-8:
+                    order = {
                         "coin": cfg.coin,
                         "is_buy": False,
                         "size": ask_sz,
                         "price": ask_price,
                         "post_only": True,
                         "level": i,
-                    })
+                    }
+                    if use_reduce_only and has_position:
+                        order["reduce_only"] = True
+                    orders.append(order)
 
         return orders
 
